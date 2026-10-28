@@ -262,7 +262,23 @@ makepkg -f
 
 The `PKGBUILD` builds from the files in this repository, which is private, and
 the built package is published as a release artifact there. Do not commit
-`dist/`, `pkg/`, or `src/`.
+`dist/`, `pkg/`, `repo/`, or `src/`.
+
+### Private pacman repository
+
+`./make-repo.sh` builds the package and refreshes a pacman repository under
+`repo/x86_64` with `repo-add`; `--sign` / `--key KEY` sign the database. Serve
+that directory over HTTPS, or plain HTTP on a trusted network such as
+Tailscale, and add it to `/etc/pacman.conf`:
+
+```ini
+[omarchy-gdrive]
+SigLevel = Optional TrustAll
+Server = https://<host>/x86_64
+```
+
+Then `sudo pacman -Syu omarchy-gdrive`. Use
+`SigLevel = Optional DatabaseRequired` when the database is signed.
 
 ## License
 

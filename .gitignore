@@ -4,3 +4,4 @@ dist/
 *.pkg.tar.*
 *.tar.gz
 __pycache__/
+repo/
