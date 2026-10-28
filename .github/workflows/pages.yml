@@ -1,0 +1,48 @@
+# Build the pacman repository inside an Arch container and publish it with
+# GitHub Pages. Pages sites are public on Free/Pro plans: the package and the
+# repository database become world-readable when this runs.
+#
+# Enable once, after the repository is published:
+#   gh api --method POST repos/SSS-Marcelo/omarchy-gdrive/pages \
+#     -f build_type=workflow
+# Then change the trigger below to also run on push.
+name: pages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build package and repository
+        run: |
+          useradd -m builder
+          chown -R builder .
+          su builder -c './make-repo.sh'
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: repo
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

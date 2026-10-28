@@ -50,6 +50,16 @@ packages=("$repo"/*.pkg.tar.zst)
 ((${#packages[@]})) || { printf 'error: no packages in %s\n' "$repo" >&2; exit 1; }
 repo-add "${args[@]}" "$db" "${packages[@]}"
 
+# repo-add publishes omarchy-gdrive.db/.files as symlinks; static hosts such as
+# GitHub Pages do not preserve them, so store real copies.
+for link in "$repo"/*.db "$repo"/*.files; do
+  [[ -L "$link" ]] || continue
+  target="$(readlink -f "$link")"
+  rm -f "$link"
+  cp -p "$target" "$link"
+done
+find "$repo" -maxdepth 1 -name '*.old' -delete
+
 printf '\nRepository refreshed in %s:\n' "$repo"
 ls -1 "$repo"
 printf '\nServer entry:\n  Server = https://<host>/x86_64\n'
