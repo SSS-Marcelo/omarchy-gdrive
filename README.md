@@ -280,11 +280,14 @@ Server = https://<host>/x86_64
 Then `sudo pacman -Syu omarchy-gdrive`. Use
 `SigLevel = Optional DatabaseRequired` when the database is signed.
 
-A public copy can be published with GitHub Pages: the `pages` workflow builds the
-package in an `archlinux:base-devel` container and uploads `repo/`. Pages sites
-are public on Free and Pro plans, so use it only when the package can be
-world-readable. The resulting server line is
-`https://sss-marcelo.github.io/omarchy-gdrive/x86_64`.
+The public copy is served from the `omarchy-pkgs` repository, which builds the
+package in an `archlinux:base-devel` container with GitHub Pages:
+
+```ini
+[omarchy-pkgs]
+SigLevel = Optional TrustAll
+Server = https://skystone-studio.github.io/omarchy-pkgs/x86_64
+```
 
 ## License
 
