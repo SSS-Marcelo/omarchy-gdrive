@@ -1,0 +1,25 @@
+pkgbase = omarchy-gdrive
+	pkgdesc = Google Drive integration for Omarchy Files via account-named rclone FUSE mounts
+	pkgver = 0.2.0
+	pkgrel = 1
+	url = https://github.com/SSS-Marcelo/omarchy-gdrive
+	install = omarchy-gdrive.install
+	arch = any
+	license = MIT
+	depends = rclone
+	depends = fuse3
+	depends = python
+	depends = nautilus
+	depends = nautilus-python
+	source = omarchy-gdrive-setup
+	source = omarchy-gdrive-nautilus.py
+	source = omarchy-gdrive-setup.desktop
+	source = README.md
+	source = LICENSE
+	sha256sums = 05d563751aace8fdd7cd5f7870a6be45878eee7a72e4a9024be0b2822994f346
+	sha256sums = 65b4d58450fbc57e3ccb6a40ed20ac0321b8ee923b5fea21f66a12f5f1c73fc6
+	sha256sums = 5cca605113b3aacc7aec55e72deddb368fd0711486cb4a5375964ad1a675210a
+	sha256sums = 86b762c86bec25940a464bbe8f89a9e825da94698abe8515d6037b674c5c2e4f
+	sha256sums = d6646ba1fcc87c4e1d9213fa8e420e67b7188b1f7bd120af54d016f6e18f0e1f
+
+pkgname = omarchy-gdrive
