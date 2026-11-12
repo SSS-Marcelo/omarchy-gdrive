@@ -195,6 +195,18 @@ listings_exist() {
   compgen -G "$workdir/*.path1.lst" >/dev/null && compgen -G "$workdir/*.path2.lst" >/dev/null
 }
 
+# True when either side's listing from the last run has no entries.
+listing_empty() {
+  local listing
+  for listing in "$workdir"/*.path1.lst "$workdir"/*.path2.lst; do
+    [[ -f "$listing" ]] || continue
+    if ! grep -vq '^#' "$listing"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Files recorded on the local side at the last successful sync.
 listing_count() {
   local listing
@@ -225,10 +237,15 @@ run_bisync() {
 
   if ! listings_exist; then
     mode=initial
+  elif [[ "$mode" == normal ]] && listing_empty; then
+    # bisync refuses to run from an empty listing (it cannot tell an empty
+    # drive from a failed listing). A resync never deletes, so it is the safe
+    # way to sync a drive or folder that was empty last time.
+    mode=reselect
   fi
   if [[ "$mode" == reselect ]]; then
-    set_status syncing "updating folders kept on this device"
-    log "Folders kept on this device changed; rebuilding the sync state without deleting anything."
+    set_status syncing "rebuilding sync state"
+    listing_empty || log "Folders kept on this device changed; rebuilding the sync state without deleting anything."
     # A resync never deletes. It downloads newly pinned folders and uploads
     # folders created locally, and forgets the ones that went online-only.
     rclone_run --resync-mode newer

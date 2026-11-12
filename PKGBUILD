@@ -1,7 +1,7 @@
 # Maintainer: SSS-Marcelo
 pkgname=omarchy-gdrive
 pkgver=0.5.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Google Drive for Omarchy Files: locally synced folders per account with automatic upload'
 arch=('any')
 url='https://github.com/SSS-Marcelo/omarchy-gdrive'
@@ -17,7 +17,7 @@ source=('omarchy-gdrive-setup'
         'README.md'
         'LICENSE')
 sha256sums=('ab8dc9e2db150baa4f01d6a587c9a3c6ccf929365708906987d9a5b51e768daf'
-            '259138c283dd3e3a7444bcb22530fb22bb912ee7ea5b9ba1de57a4d3d86da846'
+            '7aa910ec77de0a26d6a83e2d0f40556bd77e0ede28fac57a5bacc961e33410cb'
             '1cb5b965e9a0f1845fdcabb2b5d33f9ceee94332261f89eb6878cdf7072ad906'
             '12e383dc663007a62e405eea5b9cc1cb296dfa247750972f721dbc41ed78f2cf'
             '5cca605113b3aacc7aec55e72deddb368fd0711486cb4a5375964ad1a675210a'
