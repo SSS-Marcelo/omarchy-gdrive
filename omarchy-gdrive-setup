@@ -35,7 +35,11 @@ Modes:
 
 Environment:
   GDRIVE_ROOT            Parent folder for account folders (default: ~/GoogleDrive)
-  GDRIVE_SHARED_DRIVES   Sync every Google Shared drive (default: on, set off to skip)
+  GDRIVE_SHARED_DRIVES   Show every Google Shared drive (default: on, set off to skip)
+  GDRIVE_SHARED_DEFAULT  How a newly added Shared drive starts: online (default;
+                         nothing downloaded until you choose Keep on This Device
+                         in Files) or sync (download everything). Drives that
+                         already synced keep their setting.
   GDRIVE_SHARED_WITH_ME  Also sync "Shared with me" (default: off)
   GDRIVE_SYNC_INTERVAL   Seconds between Google Drive checks (default: 60, min 15)
   GDRIVE_GDOCS           Google Docs as: link (default, opens in the browser),
@@ -43,7 +47,8 @@ Environment:
   RCLONE_BIN             rclone binary (default: rclone from PATH)
 
 Each account also gets ~/GoogleDrive/Shared drives/<email>/<drive> for every
-Google Shared drive it can see, one sync service per drive.
+Google Shared drive it can see, one service per drive. Shared drives start
+online-only; choose Keep on This Device in Files to sync one.
 
 First-time setup without your own OAuth client uses rclone's shared client,
 which is rate-limited and being retired during 2026. See:
@@ -519,7 +524,7 @@ unit_environment() {
 # callers must quote any value that may contain spaces.
 write_unit() {
   local unit=$1 description=$2 mount=$3 remote=$4
-  local extra=${5:-}
+  local extra=${5:-} initial_mode=${6:-}
   local tmp="$unit.tmp"
   cat >"$tmp" <<EOF
 [Unit]
@@ -528,8 +533,10 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-$(unit_environment)
-ExecStartPre=/usr/bin/mkdir -p "$mount"
+$(unit_environment)${initial_mode:+
+Environment="GDRIVE_INITIAL_MODE=$initial_mode"}
+# An online-only drive folder is a symlink, so a failed mkdir is not fatal.
+ExecStartPre=-/usr/bin/mkdir -p "$mount"
 ExecStart="$sync_bin" "$remote:" "$mount"${extra:+ $extra}
 # SIGTERM reaches only the sync loop, which lets rclone finish gracefully.
 KillMode=mixed
@@ -684,6 +691,11 @@ setup_shared_drives() {
   local -a mounts=() units=() labels=() keep=() restart=() start_units=()
   local drives="" id name slug mount unit_name unit failures=0 index need
 
+  local shared_initial=online
+  case "${GDRIVE_SHARED_DEFAULT:-online}" in
+    sync|local|all) shared_initial=sync ;;
+  esac
+
   if ! disabled "${GDRIVE_SHARED_DRIVES:-on}"; then
     if ! drives="$(shared_drives "$remote")"; then
       warn "could not list shared drives for $email; existing shared mounts are left untouched"
@@ -703,7 +715,7 @@ setup_shared_drives() {
         fi
         need=0
         if write_unit "$unit" "Google Drive ($email) — $name" "$mount" "$remote" \
-          "--drive-team-drive \"$id\""; then
+          "--drive-team-drive \"$id\"" "$shared_initial"; then
           need=1
         fi
         if ! systemctl --user is-active --quiet "$unit_name"; then

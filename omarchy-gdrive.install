@@ -8,8 +8,11 @@ Connect an account:
 Add more accounts from Files: right-click an empty area and choose
 "Add Google Drive Account…" (needs nautilus-python).
 
-Each account is synced to ~/GoogleDrive/<email>: every file is stored
-locally and saves are uploaded to Google Drive automatically.
+Each account's My Drive is synced to ~/GoogleDrive/<email>: every file is
+stored locally and saves are uploaded to Google Drive automatically.
+Shared drives start online-only; right-click one in Files and choose
+"Keep Everything on This Device" (or "Keep on This Device" on a folder)
+to sync it.
 
 Files loads extensions at startup, so restart it once after installing:
   nautilus --quit
@@ -24,15 +27,15 @@ EOF
 
 post_upgrade() {
   cat <<'EOF'
-Google Drive for Omarchy now keeps a full local copy of every account and
-shared drive instead of downloading files on demand. Local saves upload within
-seconds; Google Drive is checked every minute and wins conflicts (your local
-edit is kept beside it as a .conflict copy).
+Google Drive for Omarchy keeps My Drive fully synced on this device.
+Newly added Shared drives now start online-only (nothing downloaded) until
+you choose "Keep Everything on This Device" or "Keep on This Device" on a
+folder in Files. Shared drives that already sync keep syncing.
 
-Run the setup once to switch your existing mounts to synced folders:
+Upgrading from 0.4 or earlier (FUSE mounts)? Run the setup once:
   omarchy-gdrive-setup
 
-Then restart Files to load the new Sync Now / Pause menu items:
+Restart Files to load the new menu items:
   nautilus --quit
 EOF
 }

@@ -66,6 +66,13 @@ state_dir_for_root() {
   return 1
 }
 
+# all | selected | online, as recorded by the sync daemon.
+root_mode() {
+  local dir
+  dir="$(state_dir_for_root "$1")" || { printf 'all\n'; return; }
+  head -1 "$dir/selection" 2>/dev/null || printf 'all\n'
+}
+
 require_root() {
   unit="$(unit_for_root "$1")" || { printf 'error: no Google Drive folder at %s\n' "$1" >&2; exit 1; }
 }
@@ -136,7 +143,9 @@ case "$mode" in
         IFS=$'\t' read -r state when message <"$dir/status" || true
         printf '%s %s %s\n' "${state:-unknown}" "$(date -d "@${when:-0}" '+%F %T' 2>/dev/null)" "${message:-}"
       fi
-      if [[ "$(head -1 "$dir/selection" 2>/dev/null)" == selected ]]; then
+      if [[ "$(head -1 "$dir/selection" 2>/dev/null)" == online ]]; then
+        printf 'kept on this device: nothing (the whole drive is online-only)\n'
+      elif [[ "$(head -1 "$dir/selection" 2>/dev/null)" == selected ]]; then
         printf 'kept on this device: selected folders\n'
         for link in "$root"/* "$root"/.[!.]*; do
           [[ -L "$link" ]] && printf '  online-only: %s\n' "${link##*/}"
@@ -186,7 +195,10 @@ case "$mode" in
     for folder in "$@"; do
       folder=${folder%/}
       split_folder "$folder" || { printf 'error: %s is not a folder directly inside a Google Drive folder\n' "$folder" >&2; exit 1; }
-      [[ -L "$folder" ]] || { printf '%s is already on this device\n' "$folder"; continue; }
+      if [[ "$(root_mode "$folder_root")" != online && ! -L "$folder" ]]; then
+        printf '%s is already on this device\n' "$folder"
+        continue
+      fi
       queue "$folder_root" pin "$folder_name"
       printf 'Downloading %s to keep it on this device\n' "$folder"
     done
@@ -198,7 +210,7 @@ case "$mode" in
     for folder in "$@"; do
       folder=${folder%/}
       split_folder "$folder" || { printf 'error: %s is not a folder directly inside a Google Drive folder\n' "$folder" >&2; exit 1; }
-      if [[ -L "$folder" ]]; then
+      if [[ -L "$folder" || "$(root_mode "$folder_root")" == online ]]; then
         printf '  %s is already online-only\n' "$folder"
         continue
       fi
@@ -225,6 +237,10 @@ case "$mode" in
   --unpin-all)
     root=${1%/}
     require_root "$root"
+    if [[ "$(root_mode "$root")" == online ]]; then
+      printf '%s is already online-only.\n' "$root"
+      exit 0
+    fi
     declare -a dirs=()
     while IFS= read -r -d '' folder; do
       dirs+=("$folder")

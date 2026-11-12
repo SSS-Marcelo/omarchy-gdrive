@@ -1,8 +1,8 @@
 # Maintainer: SSS-Marcelo
 pkgname=omarchy-gdrive
-pkgver=0.5.0
-pkgrel=2
-pkgdesc='Google Drive for Omarchy Files: locally synced folders per account with automatic upload'
+pkgver=0.6.0
+pkgrel=1
+pkgdesc='Google Drive for Omarchy Files: My Drive synced locally with auto-save, Shared drives online until kept on this device'
 arch=('any')
 url='https://github.com/SSS-Marcelo/omarchy-gdrive'
 license=('MIT')
@@ -16,12 +16,12 @@ source=('omarchy-gdrive-setup'
         'omarchy-gdrive-setup.desktop'
         'README.md'
         'LICENSE')
-sha256sums=('ab8dc9e2db150baa4f01d6a587c9a3c6ccf929365708906987d9a5b51e768daf'
-            '7aa910ec77de0a26d6a83e2d0f40556bd77e0ede28fac57a5bacc961e33410cb'
-            '1cb5b965e9a0f1845fdcabb2b5d33f9ceee94332261f89eb6878cdf7072ad906'
-            '12e383dc663007a62e405eea5b9cc1cb296dfa247750972f721dbc41ed78f2cf'
+sha256sums=('9b42bfb20fb44249a70f947bce0bbe70815b067413fd3ee7e561266c29d029e6'
+            '6fa055f50a92475b0ebac82377ace9f529a4a14dac7a0700b3619caab1297d02'
+            '28061dc377dcb2af4f8e02c32d08bdaf78dd7486cb55b2991358ad38a98ca3c3'
+            '043b26549877b487605cb78c57049f78f2c80c6304bab6e6c0f171055beb9671'
             '5cca605113b3aacc7aec55e72deddb368fd0711486cb4a5375964ad1a675210a'
-            '62f0abc7534c4dc9b6a095b722bac7f334f210a1f02c04cee8ecdd7678ee91ce'
+            'c4939e3481a1bf3016d21f6cf172b998bf1b892b6466dbab113eab2e6983e52f'
             'd6646ba1fcc87c4e1d9213fa8e420e67b7188b1f7bd120af54d016f6e18f0e1f')
 
 package() {

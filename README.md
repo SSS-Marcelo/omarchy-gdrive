@@ -1,7 +1,8 @@
 # Google Drive for Omarchy Files
 
-Keeps every Google Drive account, and every Shared drive it can see, synced to
-an ordinary local folder, the way Google Drive for desktop ("Mirror files") and
+Keeps every Google Drive account's My Drive synced to an ordinary local folder,
+and shows every Shared drive online-only until you choose to keep it on this
+device, the way Google Drive for desktop ("Mirror files") and
 OneDrive ("Always keep on this device") work on other systems. Files open
 instantly because they are already on disk. Saves upload to Google Drive
 automatically, and Google Drive remains the source of truth. Sync runs on
@@ -10,9 +11,13 @@ folder, started at login.
 
 ## Features
 
-- Every account syncs to `~/GoogleDrive/<email>` and every Google Shared drive
-  to `~/GoogleDrive/Shared drives/<email>/<drive>`, each with its own systemd
-  user service.
+- My Drive syncs to `~/GoogleDrive/<email>` and every Google Shared drive
+  appears at `~/GoogleDrive/Shared drives/<email>/<drive>`, each with its own
+  systemd user service.
+- **Shared drives start online-only**: they are browsable and editable at once,
+  and nothing is downloaded until you right-click the drive in Files and choose
+  **Keep Everything on This Device**, or **Keep on This Device** on a folder in
+  it (`GDRIVE_SHARED_DEFAULT=sync` downloads them all instead).
 - **Stored locally**: every file is on disk, so opening, previewing, and
   searching never wait for a download, and files stay available offline.
 - **Auto-save to Google Drive**: a file watcher (`inotifywait`) uploads a save a
@@ -65,14 +70,14 @@ From the built architecture-independent package:
 
 ```bash
 sudo pacman -S --needed rclone inotify-tools libnotify fuse3 python nautilus nautilus-python
-sudo pacman -U omarchy-gdrive-0.5.0-1-any.pkg.tar.zst
+sudo pacman -U omarchy-gdrive-0.6.0-1-any.pkg.tar.zst
 ```
 
 Or build from source:
 
 ```bash
-tar -xzf omarchy-gdrive-0.5.0.tar.gz
-cd omarchy-gdrive-0.5.0
+tar -xzf omarchy-gdrive-0.6.0.tar.gz
+cd omarchy-gdrive-0.6.0
 makepkg -si
 ```
 
@@ -118,7 +123,12 @@ Then open **Files** again.
 ## Shared drives
 
 Google Shared drives (formerly Team drives) are separate Drive roots, so each
-one gets its own synced folder beside the account's My Drive folder:
+one gets its own folder beside the account's My Drive folder. A newly added
+Shared drive starts **online-only**: the folder is a link to an on-demand
+mount, files download when opened, and saves upload about 5 seconds after
+the file is closed. To sync it, right-click the drive folder in Files and
+choose **Keep Everything on This Device**, or right-click one of its folders
+and choose **Keep on This Device** to download only that folder.
 
 ```text
 ~/GoogleDrive/marcelo@example.com                     My Drive
@@ -133,7 +143,8 @@ the local copy is left on disk for you to delete.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `GDRIVE_SHARED_DRIVES` | `on` | `off` stops syncing every shared drive |
+| `GDRIVE_SHARED_DRIVES` | `on` | `off` removes every shared drive |
+| `GDRIVE_SHARED_DEFAULT` | `online` | How a **newly added** Shared drive starts: `online` (nothing downloaded) or `sync` (download everything). Drives that already synced keep their setting |
 | `GDRIVE_SHARED_WITH_ME` | `off` | `1` adds `~/GoogleDrive/Shared with me/<email>` using `--drive-shared-with-me` (mostly read-only: uploads into files you don't own fail) |
 
 Each synced folder lists its Drive root once per check (every 60 s by default).
@@ -161,8 +172,9 @@ drive.google.com: a local rename is synced as delete + create.
 
 ## Choose what is kept on this device
 
-By default everything is kept on this device. Any **top-level folder** of My
-Drive or of a Shared drive can be made online-only. For example, a client
+By default everything in My Drive is kept on this device, and Shared drives
+are entirely online-only. Any **top-level folder** of My Drive or of a Shared
+drive can be switched either way. For example, a client
 folder directly inside the `Clients` shared drive can be online-only, but a
 folder nested deeper cannot.
 
@@ -182,7 +194,8 @@ On the account or shared-drive folder itself:
 
 - **Make All Folders Online-Only** does the same for every top-level folder
   (files directly in the root stay local).
-- **Keep Everything on This Device** downloads everything again.
+- **Keep Everything on This Device** downloads everything, including a Shared
+  drive that is still online-only.
 
 An online-only folder is a symlink into an on-demand rclone mount of the same
 Drive (under `~/.local/state/omarchy-gdrive/sync/<id>/online`), so it appears in
@@ -257,6 +270,13 @@ Account name@example.com is already configured; token updated.
 New rclone remotes are named `gdrive-<slug>-<hash8>`, where the slug comes from
 the email's local part and `hash8` is the first eight hex characters of
 `sha256(email)`. The very first account keeps the plain `gdrive` remote name.
+
+## Upgrade from 0.5
+
+0.6.0 only changes how **new** Shared drives start. Shared drives that already
+synced under 0.5 stay synced, even after `omarchy-gdrive-setup` adds the new
+default to their services. To free them up, use **Make All Folders
+Online-Only**.
 
 ## Upgrade from 0.4 or earlier (FUSE mounts)
 
@@ -455,6 +475,10 @@ Path1:
   (**Sync Now**).
 - `SIGTERM` is passed to rclone as `SIGINT` (bisync graceful shutdown), so
   logging out or pausing never leaves broken listings.
+- A Shared drive with no sync history starts in `online` mode
+  (`GDRIVE_INITIAL_MODE=online` in its unit): the drive folder is a symlink to
+  the on-demand mount and no bisync runs. Keeping a folder, or everything, on
+  this device turns it back into a real folder and runs the first sync.
 - When a drive has online-only folders, the folders kept locally are written
   into the bisync filter (`+ /<folder>/**`, `+ /*`, `- **`). Any change to that
   set triggers a `--resync-mode newer`, which downloads newly kept folders and

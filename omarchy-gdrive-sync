@@ -21,6 +21,11 @@
 # Every real (non-symlink) top-level folder is kept on this device, including
 # folders created locally. Root-level files are always kept on this device.
 #
+# A whole drive can also be online-only (GDRIVE_INITIAL_MODE=online, the default
+# that omarchy-gdrive-setup gives Shared drives): LOCAL is then a symlink to the
+# on-demand mount and nothing is downloaded until a folder, or everything, is
+# kept on this device.
+#
 # SIGUSR1 forces an immediate sync; with a "force" file in the state
 # directory (omarchy-gdrive-mount --force-sync) it also confirms a bulk delete.
 # SIGTERM finishes the current transfer cleanly (bisync graceful shutdown) and exits.
@@ -331,7 +336,7 @@ read_selection() {
   local first=1 line
   while IFS= read -r line; do
     if ((first)); then
-      [[ "$line" == selected ]] && sel_mode=selected
+      case "$line" in selected|online) sel_mode=$line ;; esac
       first=0
     elif [[ -n "$line" ]]; then
       sel_pins+=("$line")
@@ -539,7 +544,72 @@ maintain_links() {
   done < <(our_links)
 }
 
+# The drive folder itself points at the on-demand mount.
+ensure_root_link() {
+  if [[ -L "$local_path" ]]; then
+    [[ "$(readlink "$local_path")" == "$online_dir" ]] && return 0
+    rm -f -- "$local_path"
+  elif [[ -d "$local_path" ]]; then
+    if ! rmdir -- "$local_path" 2>/dev/null; then
+      # Local files exist: never hide them behind the mount; sync them instead.
+      log "$local_path already has local files; syncing it instead of leaving it online-only."
+      sel_mode=all
+      write_selection
+      return 1
+    fi
+  fi
+  ln -s "$online_dir" "$local_path"
+}
+
+# Whole drive online-only: no bisync, only the mount and pin requests.
+online_cycle() {
+  start_online || { set_status error "on-demand mount unavailable"; return 1; }
+  ensure_root_link || return 0
+  local req name all=0 work="$requests.work"
+  local -a pins=()
+  if [[ -s "$requests" ]]; then
+    mv -f "$requests" "$work"
+    while IFS=$'\t' read -r req name; do
+      case "$req" in
+        pin) safe_name "$name" && [[ -d "$online_dir/$name" ]] && pins+=("$name") ;;
+        pin-all) all=1 ;;
+      esac
+    done <"$work"
+    rm -f "$work"
+  fi
+  if ((all == 0 && ${#pins[@]} == 0)); then
+    set_status ok "online-only"
+    return 0
+  fi
+
+  # Leave online-only: the drive folder becomes a real folder again.
+  [[ -L "$local_path" ]] && rm -f -- "$local_path"
+  mkdir -p -- "$local_path"
+  rm -f "$workdir"/*.lst* 2>/dev/null
+  if ((all == 1)); then
+    sel_mode=all
+    sel_pins=()
+    log "Keeping everything in $label on this device."
+  else
+    sel_mode=selected
+    for name in "${pins[@]}"; do
+      mkdir -p -- "$local_path/$name"
+      log "Keeping $name on this device."
+    done
+    mapfile -t sel_pins < <(real_dirs)
+  fi
+  write_selection
+  start_watcher
+  run_bisync || return $?
+  maintain_links || true
+  return 0
+}
+
 run_cycle() {
+  if [[ "$sel_mode" == online ]]; then
+    online_cycle
+    return $?
+  fi
   run_bisync || return $?
   ((stopping == 1)) && return 0
   apply_selection || return $?
@@ -550,10 +620,18 @@ run_cycle() {
 
 # --- safety before the first run ---------------------------------------------
 
-mkdir -p "$local_path"
+read_selection
+# A drive with no sync history can start online-only (Shared drives do, by
+# default). Drives that already synced keep their mode.
+if [[ ! -f "$selection_file" ]] && ! listings_exist && [[ "${GDRIVE_INITIAL_MODE:-sync}" == online ]]; then
+  sel_mode=online
+  write_selection
+fi
+
+[[ -L "$local_path" ]] || mkdir -p "$local_path"
 
 # An rclone FUSE mount from omarchy-gdrive <= 0.4 may still sit on the folder.
-if mountpoint -q "$local_path" 2>/dev/null; then
+if [[ ! -L "$local_path" ]] && mountpoint -q "$local_path" 2>/dev/null; then
   log "Unmounting the old rclone mount at $local_path"
   fusermount3 -u "$local_path" 2>/dev/null || fusermount3 -uz "$local_path" 2>/dev/null || true
   sleep 1
@@ -569,6 +647,8 @@ fi
 events=""
 watcher=0
 start_watcher() {
+  ((watcher > 0)) && return 0
+  [[ -L "$local_path" ]] && return 0
   command -v inotifywait >/dev/null 2>&1 || { log "inotifywait not found; checking local changes every ${interval}s"; return; }
   events="$state_dir/events"
   rm -f "$events"
@@ -597,10 +677,14 @@ drain_events() {
   while IFS= read -r -t 0.2 line <&3; do :; done
 }
 
-log "Syncing $local_path <-> $remote_path (Drive check every ${interval}s)."
-read_selection
-if [[ "$sel_mode" == selected ]]; then
-  start_online && maintain_links
+if [[ "$sel_mode" == online ]]; then
+  log "$local_path is online-only: files open on demand from $remote_path."
+  start_online && ensure_root_link
+else
+  log "Syncing $local_path <-> $remote_path (Drive check every ${interval}s)."
+  if [[ "$sel_mode" == selected ]]; then
+    start_online && maintain_links
+  fi
 fi
 start_watcher
 

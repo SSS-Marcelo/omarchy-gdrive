@@ -104,23 +104,42 @@ def is_active(unit):
         return False
 
 
-def sync_status(path):
-    """(state, message) written by omarchy-gdrive-sync for this folder."""
+def state_dir(path):
+    """omarchy-gdrive-sync state directory for a synced root."""
     root = state_home() / "omarchy-gdrive" / "sync"
     try:
         dirs = list(root.iterdir())
     except OSError:
-        return ("", "")
+        return None
     for directory in dirs:
         try:
             lines = (directory / "target").read_text().splitlines()
-            if len(lines) < 2 or lines[1] != path:
-                continue
-            fields = (directory / "status").read_text().rstrip("\n").split("\t")
         except OSError:
             continue
-        return (fields[0], fields[2] if len(fields) > 2 else "")
-    return ("", "")
+        if len(lines) >= 2 and lines[1] == path:
+            return directory
+    return None
+
+
+def sync_status(path):
+    """(state, message) written by omarchy-gdrive-sync for this folder."""
+    directory = state_dir(path)
+    if directory is None:
+        return ("", "")
+    try:
+        fields = (directory / "status").read_text().rstrip("\n").split("\t")
+    except OSError:
+        return ("", "")
+    return (fields[0], fields[2] if len(fields) > 2 else "")
+
+
+def drive_mode(path):
+    """all, selected, or online (the whole drive is online-only)."""
+    directory = state_dir(path)
+    try:
+        return (directory / "selection").read_text().split("\n", 1)[0] or "all"
+    except (OSError, TypeError):
+        return "all"
 
 
 class OmarchyGDriveMenu(GObject.GObject, Nautilus.MenuProvider):
@@ -151,7 +170,9 @@ class OmarchyGDriveMenu(GObject.GObject, Nautilus.MenuProvider):
             if unit is None:
                 return []
             roots.add((root, unit))
-            if os.path.islink(path) and os.path.isdir(path):
+            if drive_mode(root) == "online" and os.path.isdir(path):
+                online.append(os.path.join(root, os.path.basename(path)))
+            elif os.path.islink(path) and os.path.isdir(path):
                 online.append(os.path.join(root, os.path.basename(path)))
             elif os.path.isdir(path):
                 local.append(os.path.join(root, os.path.basename(path)))
@@ -180,10 +201,12 @@ class OmarchyGDriveMenu(GObject.GObject, Nautilus.MenuProvider):
                                     "edit-delete", [path], "--force-sync"))
         if active:
             entries = children(path)
-            if any(e.is_symlink() for e in entries):
+            whole_drive_online = drive_mode(path) == "online"
+            if whole_drive_online or any(e.is_symlink() for e in entries):
                 items.append(self._item("pin_all", "Keep Everything on This Device",
                                         "folder-download", [path], "--pin-all"))
-            if any(not e.is_symlink() for e in entries) and shutil.which(LAUNCHER):
+            if (not whole_drive_online and any(not e.is_symlink() for e in entries)
+                    and shutil.which(LAUNCHER)):
                 items.append(self._terminal_item("unpin_all", "Make All Folders Online-Only",
                                                  "edit-clear", [path], "--unpin-all"))
             items.append(self._item("pause", "Pause Google Drive Sync",
