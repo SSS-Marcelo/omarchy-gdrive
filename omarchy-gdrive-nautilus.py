@@ -1,8 +1,13 @@
 """Files integration for omarchy-gdrive.
 
 - Background menu: "Add Google Drive Account…" runs the setup in a terminal.
-- Item menu: "Disconnect"/"Connect Google Drive mount" on an account mount
-  (~/GoogleDrive/<email>) or a Google Shared drive mount.
+- Item menu on an account folder (~/GoogleDrive/<email>) or a Google Shared
+  drive folder: "Sync Google Drive Now", "Pause"/"Resume Google Drive Sync",
+  "Keep Everything on This Device", "Make All Folders Online-Only", and
+  "Confirm Deletions and Sync" when a bulk delete paused the sync.
+- Item menu on folders directly inside one of those: "Keep on This Device" for
+  online-only folders, "Free Up Space (Online Only)" for local ones. Freeing up
+  space opens a terminal that shows the real paths and asks before deleting.
 
 Installed as /usr/share/nautilus-python/extensions/omarchy-gdrive.py.
 """
@@ -10,6 +15,7 @@ Installed as /usr/share/nautilus-python/extensions/omarchy-gdrive.py.
 import os
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 from gi import require_version
@@ -27,8 +33,17 @@ def config_home():
     return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 
 
+UNIT_PATH = re.compile(
+    r'^ExecStart=.*(?:omarchy-gdrive-sync"| mount) "[^"]*" "([^"]*)"', re.MULTILINE
+)
+
+
+def state_home():
+    return Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+
 def mount_units():
-    """Map every omarchy-gdrive mount point to the systemd unit that owns it."""
+    """Map every omarchy-gdrive folder to the systemd unit that owns it."""
     units = {}
     unit_dir = config_home() / "systemd" / "user"
     try:
@@ -40,13 +55,15 @@ def mount_units():
             text = unit_file.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        match = re.search(r'^ExecStart=.* mount "[^"]*" "([^"]*)"', text, re.MULTILINE)
+        match = UNIT_PATH.search(text)
         if match:
             units[match.group(1)] = unit_file.stem
     return units
 
 
 def path_of(file_info):
+    """Path as shown in Files. Symlinks are not resolved: an online-only folder
+    is a symlink into the on-demand mount and must keep its own path."""
     try:
         location = file_info.get_location()
     except Exception:
@@ -54,14 +71,56 @@ def path_of(file_info):
     if location is None:
         return None
     path = location.get_path()
-    return os.path.realpath(path) if path else None
+    return os.path.normpath(path) if path else None
 
 
-def is_mount(path):
+def root_unit(units, path):
+    """Unit for a sync root, matching the path as given or fully resolved."""
+    if path in units:
+        return path, units[path]
+    real = os.path.realpath(path)
+    if real in units:
+        return real, units[real]
+    return None, None
+
+
+def children(root):
     try:
-        return os.path.ismount(path)
+        with os.scandir(root) as entries:
+            return [e for e in entries if e.is_dir() and not e.name.startswith(".Trash-")]
     except OSError:
+        return []
+
+
+def is_active(unit):
+    try:
+        return (
+            subprocess.run(
+                ["systemctl", "--user", "is-active", "--quiet", unit], timeout=2
+            ).returncode
+            == 0
+        )
+    except (OSError, subprocess.SubprocessError):
         return False
+
+
+def sync_status(path):
+    """(state, message) written by omarchy-gdrive-sync for this folder."""
+    root = state_home() / "omarchy-gdrive" / "sync"
+    try:
+        dirs = list(root.iterdir())
+    except OSError:
+        return ("", "")
+    for directory in dirs:
+        try:
+            lines = (directory / "target").read_text().splitlines()
+            if len(lines) < 2 or lines[1] != path:
+                continue
+            fields = (directory / "status").read_text().rstrip("\n").split("\t")
+        except OSError:
+            continue
+        return (fields[0], fields[2] if len(fields) > 2 else "")
+    return ("", "")
 
 
 class OmarchyGDriveMenu(GObject.GObject, Nautilus.MenuProvider):
@@ -70,36 +129,103 @@ class OmarchyGDriveMenu(GObject.GObject, Nautilus.MenuProvider):
         if not files:
             return []
         try:
-            if len(files) != 1:
-                return []
-            file_info = files[0]
+            paths = [path_of(f) for f in files]
         except TypeError:
             return []
-
-        path = path_of(file_info)
-        if path is None or path not in mount_units():
+        if not paths or any(p is None for p in paths) or shutil.which(MOUNT) is None:
             return []
-        if shutil.which(MOUNT) is None:
+        units = mount_units()
+
+        if len(paths) == 1:
+            root, unit = root_unit(units, paths[0])
+            if unit is not None:
+                return self._root_items(root, unit)
+        return self._folder_items(units, paths)
+
+    def _folder_items(self, units, paths):
+        """Pin/unpin for folders directly inside one synced root."""
+        roots = set()
+        online, local = [], []
+        for path in paths:
+            root, unit = root_unit(units, os.path.dirname(path))
+            if unit is None:
+                return []
+            roots.add((root, unit))
+            if os.path.islink(path) and os.path.isdir(path):
+                online.append(os.path.join(root, os.path.basename(path)))
+            elif os.path.isdir(path):
+                local.append(os.path.join(root, os.path.basename(path)))
+            else:
+                return []
+        if len(roots) != 1 or not is_active(next(iter(roots))[1]):
             return []
+        items = []
+        if online:
+            items.append(self._item("pin", "Keep on This Device",
+                                    "folder-download", online, "--pin"))
+        if local and shutil.which(LAUNCHER):
+            items.append(self._terminal_item("unpin", "Free Up Space (Online Only)",
+                                             "edit-clear", local, "--unpin"))
+        return items
 
-        connected = is_mount(path)
-        item = Nautilus.MenuItem(
-            name="OmarchyGDrive::toggle_mount",
-            label="Disconnect Google Drive mount"
-            if connected
-            else "Connect Google Drive mount",
-            icon="media-playback-stop" if connected else "media-playback-start",
-        )
-        item.connect("activate", self._on_toggle, path, connected)
-        return [item]
+    def _root_items(self, path, unit):
+        items = []
+        active = is_active(unit)
+        state, message = sync_status(path)
+        if active:
+            items.append(self._item("sync_now", "Sync Google Drive Now",
+                                    "view-refresh", [path], "--sync-now"))
+        if state == "error" and "deletion" in message:
+            items.append(self._item("force_sync", "Confirm Deletions and Sync",
+                                    "edit-delete", [path], "--force-sync"))
+        if active:
+            entries = children(path)
+            if any(e.is_symlink() for e in entries):
+                items.append(self._item("pin_all", "Keep Everything on This Device",
+                                        "folder-download", [path], "--pin-all"))
+            if any(not e.is_symlink() for e in entries) and shutil.which(LAUNCHER):
+                items.append(self._terminal_item("unpin_all", "Make All Folders Online-Only",
+                                                 "edit-clear", [path], "--unpin-all"))
+            items.append(self._item("pause", "Pause Google Drive Sync",
+                                    "media-playback-pause", [path], "--pause"))
+        else:
+            items.append(self._item("resume", "Resume Google Drive Sync",
+                                    "media-playback-start", [path], "--resume"))
+        return items
 
-    def _on_toggle(self, _item, path, connected):
+    def _item(self, name, label, icon, paths, flag):
+        item = Nautilus.MenuItem(name="OmarchyGDrive::" + name, label=label, icon=icon)
+        item.connect("activate", self._run_helper, paths, flag)
+        return item
+
+    def _run_helper(self, _item, paths, flag):
         helper = shutil.which(MOUNT)
         if helper is None:
             return
         # Gio.Subprocess.new does not wait, so Nautilus stays responsive.
+        Gio.Subprocess.new([helper, flag] + list(paths), Gio.SubprocessFlags.NONE)
+
+    def _terminal_item(self, name, label, icon, paths, flag):
+        item = Nautilus.MenuItem(name="OmarchyGDrive::" + name, label=label, icon=icon)
+        item.connect("activate", self._run_in_terminal, paths, flag)
+        return item
+
+    def _run_in_terminal(self, _item, paths, flag):
+        """Deleting local copies is confirmed in a terminal that shows the real
+        paths, sizes, and filesystems first."""
+        helper = shutil.which(MOUNT)
+        if helper is None:
+            return
         Gio.Subprocess.new(
-            [helper, "--disconnect" if connected else "--connect", path],
+            [
+                LAUNCHER,
+                "bash",
+                "-c",
+                '"$0" "$@"; printf "\\nPress Enter to close…"; read -r',
+                helper,
+                flag,
+            ]
+            + list(paths),
             Gio.SubprocessFlags.NONE,
         )
 

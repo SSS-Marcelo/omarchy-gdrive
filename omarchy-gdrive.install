@@ -8,14 +8,14 @@ Connect an account:
 Add more accounts from Files: right-click an empty area and choose
 "Add Google Drive Account…" (needs nautilus-python).
 
-Each account is mounted at ~/GoogleDrive/<email> and listed in the Files
-sidebar under its email address.
+Each account is synced to ~/GoogleDrive/<email>: every file is stored
+locally and saves are uploaded to Google Drive automatically.
 
 Files loads extensions at startup, so restart it once after installing:
   nautilus --quit
 
 The first run opens a browser for Google authorization and creates the
-mount point, the bookmark, and a systemd user service per account.
+sync folder, the bookmark, and a systemd user service per account.
 
 For reliable access, configure your own OAuth client:
   https://rclone.org/drive/#making-your-own-client-id
@@ -24,16 +24,15 @@ EOF
 
 post_upgrade() {
   cat <<'EOF'
-Google Drive for Omarchy Files was upgraded to account-named mounts.
+Google Drive for Omarchy now keeps a full local copy of every account and
+shared drive instead of downloading files on demand. Local saves upload within
+seconds; Google Drive is checked every minute and wins conflicts (your local
+edit is kept beside it as a .conflict copy).
 
-Run the setup once to migrate:
+Run the setup once to switch your existing mounts to synced folders:
   omarchy-gdrive-setup
 
-It stops the old service, unmounts ~/GoogleDrive, recreates the mount at
-~/GoogleDrive/<email>, and rewrites the bookmark and the systemd unit.
-Until you run it, the sidebar still points at the old ~/GoogleDrive entry.
-
-Restart Files to load the new "Add Google Drive Account…" menu item:
+Then restart Files to load the new Sync Now / Pause menu items:
   nautilus --quit
 EOF
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installed as /usr/bin/omarchy-gdrive-setup by the omarchy-gdrive package.
-# Mount every Google Drive account with rclone at ~/GoogleDrive/<email> and list
-# it in the Files sidebar under its email address.
+# Keep every Google Drive account synced to a local folder at
+# ~/GoogleDrive/<email> and list it in the Files sidebar.
 #
 #   omarchy-gdrive-setup                     set up or repair all configured accounts
 #   omarchy-gdrive-setup --add-account       authorize a new account and add it
@@ -17,33 +17,38 @@ Usage:
   omarchy-gdrive-setup --reauth [ACCOUNT]  reauthorize an account, by email or rclone remote
   omarchy-gdrive-setup --help
 
-Each account is mounted at ~/GoogleDrive/<email> and appears in the Files
-sidebar under its email address. Accounts are recorded in
+Each account is synced to a local folder at ~/GoogleDrive/<email>: every file
+is stored on disk, local saves are uploaded within seconds, and Google Drive is
+checked for changes every minute. Google Drive wins conflicts; the local edit
+is kept beside it as a .conflict copy. Accounts are recorded in
 ~/.config/omarchy-gdrive/accounts.tsv, one "<email>\t<rclone-remote>" line each.
 
 Modes:
-  (default)      Refresh every configured account: recreate mount points and
-                 systemd user services, migrate a 0.1.0 single ~/GoogleDrive
-                 mount, and adopt gdrive/gdrive-* remotes that are not mapped.
-  --add-account  Authorize one more Google account and prepare its mount.
+  (default)      Refresh every configured account: recreate sync folders and
+                 systemd user services, migrate older FUSE mounts to synced
+                 folders, and adopt gdrive/gdrive-* remotes that are not mapped.
+  --add-account  Authorize one more Google account and start syncing it.
                  The same command adds the first account.
   --reauth       Force a new OAuth login for one account. With a single
                  configured account the argument is optional; otherwise pass an
                  email address or an rclone remote name.
 
 Environment:
-  GDRIVE_ROOT            Parent folder for account mounts (default: ~/GoogleDrive)
-  GDRIVE_SHARED_DRIVES   Mount every Google Shared drive (default: on, set off to skip)
-  GDRIVE_SHARED_WITH_ME  Also mount "Shared with me" (default: off)
+  GDRIVE_ROOT            Parent folder for account folders (default: ~/GoogleDrive)
+  GDRIVE_SHARED_DRIVES   Sync every Google Shared drive (default: on, set off to skip)
+  GDRIVE_SHARED_WITH_ME  Also sync "Shared with me" (default: off)
+  GDRIVE_SYNC_INTERVAL   Seconds between Google Drive checks (default: 60, min 15)
+  GDRIVE_GDOCS           Google Docs as: link (default, opens in the browser),
+                         office (.docx/.xlsx/.pptx exports), or skip
   RCLONE_BIN             rclone binary (default: rclone from PATH)
 
 Each account also gets ~/GoogleDrive/Shared drives/<email>/<drive> for every
-Google Shared drive it can see, one service per drive.
+Google Shared drive it can see, one sync service per drive.
 
 First-time setup without your own OAuth client uses rclone's shared client,
 which is rate-limited and being retired during 2026. See:
   https://rclone.org/drive/#making-your-own-client-id
-Documents are stored in ~/.config/omarchy-gdrive/setup.log.
+The setup log is ~/.local/state/omarchy-gdrive/setup.log.
 EOF
 }
 
@@ -105,6 +110,7 @@ while [[ "$gdrive_root" == */ && "$gdrive_root" != / ]]; do
 done
 
 rclone_bin="${RCLONE_BIN:-$(command -v rclone || true)}"
+sync_bin="${GDRIVE_SYNC_BIN:-$(command -v omarchy-gdrive-sync || true)}"
 
 email_re='^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$'
 valid_email() { [[ "$1" =~ $email_re ]]; }
@@ -188,7 +194,7 @@ main()
 PY
 
 # Rewrite the Files sidebar: drop legacy and stale account entries, then add one
-# entry per mounted account. argv: bookmarks, GDRIVE_ROOT, $HOME, emails...
+# entry per synced account. argv: bookmarks, GDRIVE_ROOT, $HOME, emails...
 read -r -d '' py_bookmarks <<'PY' || true
 import os
 import pathlib
@@ -300,6 +306,8 @@ command -v python3 >/dev/null || die "python3 not found (install the python pack
 command -v fusermount3 >/dev/null || die "fusermount3 not found (install fuse3)"
 command -v systemctl >/dev/null || die "systemctl not found"
 command -v timeout >/dev/null || die "timeout not found (install coreutils)"
+[[ -n "$sync_bin" && -x "$sync_bin" ]] || die "omarchy-gdrive-sync not found (reinstall omarchy-gdrive)"
+command -v inotifywait >/dev/null || warn "inotifywait not found (install inotify-tools); local saves upload on the next check instead of within seconds"
 command -v mountpoint >/dev/null || die "mountpoint not found (install util-linux)"
 [[ -c /dev/fuse ]] || die "/dev/fuse is missing"
 
@@ -488,13 +496,26 @@ unit_name_for_remote() { printf 'rclone-%s.service\n' "$1"; }
 stop_unit() { systemctl --user stop "$(unit_name_for_remote "$1")" >/dev/null 2>&1 || true; }
 start_unit() { systemctl --user restart "$(unit_name_for_remote "$1")" >/dev/null 2>&1 || true; }
 
-# Mount path recorded in a unit file, empty when there is none.
+# Local folder recorded in a unit file, empty when there is none. Reads both
+# the sync units and the rclone mount units of omarchy-gdrive <= 0.4.
 unit_mount() {
   [[ -f "$1" ]] || return 0
-  sed -n 's/^ExecStart=.* mount "[^"]*" "\([^"]*\)".*/\1/p' "$1" | head -1
+  sed -n -e 's/^ExecStart=.*omarchy-gdrive-sync" "[^"]*" "\([^"]*\)".*/\1/p' \
+    -e 's/^ExecStart=.* mount "[^"]*" "\([^"]*\)".*/\1/p' "$1" | head -1
 }
 
-# Render one mount unit. Extra arguments are appended verbatim to ExecStart, so
+# Optional Environment= lines carried from the setup run into every unit.
+unit_environment() {
+  local name
+  for name in GDRIVE_SYNC_INTERVAL GDRIVE_GDOCS RCLONE_BIN; do
+    if [[ -n "${!name:-}" ]]; then
+      printf 'Environment="%s=%s"\n' "$name" "${!name}"
+    fi
+  done
+  printf 'Environment="RCLONE_CONFIG=%s"\n' "$conf"
+}
+
+# Render one sync unit. Extra arguments are appended verbatim to ExecStart, so
 # callers must quote any value that may contain spaces.
 write_unit() {
   local unit=$1 description=$2 mount=$3 remote=$4
@@ -506,11 +527,16 @@ Description=$description
 StartLimitIntervalSec=0
 
 [Service]
-Type=notify
+Type=simple
+$(unit_environment)
 ExecStartPre=/usr/bin/mkdir -p "$mount"
-ExecStart="$rclone_bin" mount "$remote:" "$mount" --config "$conf" --cache-dir "$cache_dir" --vfs-cache-mode full --vfs-cache-max-size 10G --vfs-cache-max-age 168h --vfs-read-chunk-size 32M --vfs-read-chunk-size-limit 1G --dir-cache-time 1h --poll-interval 1m --umask 022 --log-level INFO${extra:+ $extra}
+ExecStart="$sync_bin" "$remote:" "$mount"${extra:+ $extra}
+# SIGTERM reaches only the sync loop, which lets rclone finish gracefully.
+KillMode=mixed
+TimeoutStopSec=120
+Nice=10
 Restart=on-failure
-RestartSec=10
+RestartSec=30
 
 [Install]
 WantedBy=default.target
@@ -529,19 +555,14 @@ start_unit_and_wait() {
   systemctl --user daemon-reload
   systemctl --user enable "$unit_name" >/dev/null
   systemctl --user restart "$unit_name" || true
-  for attempt in $(seq 1 30); do
-    if mountpoint -q "$mount"; then
-      break
-    fi
-    sleep 1
-  done
-  if ! mountpoint -q "$mount"; then
+  sleep 2
+  if ! systemctl --user is-active --quiet "$unit_name"; then
     systemctl --user status --no-pager "$unit_name" || true
     journalctl --user -u "$unit_name" -n 40 --no-pager || true
-    printf 'error: %s is not mounted\n' "$mount" >&2
+    printf 'error: %s is not syncing\n' "$mount" >&2
     return 1
   fi
-  printf '%s mounted at %s (service %s).\n' "$label" "$mount" "$unit_name"
+  printf '%s syncing to %s (service %s).\n' "$label" "$mount" "$unit_name"
 }
 
 # --- account setup ----------------------------------------------------------
@@ -591,7 +612,8 @@ setup_account() {
     fusermount3 -uz "$mount" >/dev/null 2>&1 || true
   fi
 
-  # The cache makes Nautilus, thumbnailers, and editors behave like a normal disk.
+  # Every file lives on disk, so Files, thumbnailers, and editors never wait
+  # for a download.
   local restart=0
   if write_unit "$unit" "Google Drive ($email)" "$mount" "$remote"; then
     restart=1
@@ -599,13 +621,10 @@ setup_account() {
   if ! systemctl --user is-active --quiet "$unit_name"; then
     restart=1
   fi
-  if ! mountpoint -q "$mount"; then
-    restart=1
-  fi
   if ((restart == 1)); then
     start_unit_and_wait "$unit_name" "$mount" "$email"
   else
-    printf '%s is already mounted at %s (service %s).\n' "$email" "$mount" "$unit_name"
+    printf '%s is already syncing to %s (service %s).\n' "$email" "$mount" "$unit_name"
   fi
 }
 
@@ -642,27 +661,28 @@ prune_shared_units() {
       continue
     fi
     mount="$(unit_mount "$unit")"
-    printf 'Removing shared mount %s\n' "${mount:-$unit_name}"
+    printf 'Stopping sync of %s\n' "${mount:-$unit_name}"
     systemctl --user disable --now "$unit_name" >/dev/null 2>&1 || true
     if [[ -n "$mount" ]] && mountpoint -q "$mount" 2>/dev/null; then
       fusermount3 -uz "$mount" >/dev/null 2>&1 || true
     fi
     rm -f "$unit"
     if [[ -n "$mount" ]]; then
-      rmdir "$mount" 2>/dev/null || true
+      # Synced files stay on disk; only an empty folder is removed.
+      rmdir "$mount" 2>/dev/null || printf '  local copy kept at %s\n' "$mount"
       rmdir "${mount%/*}" 2>/dev/null || true
     fi
   done
   systemctl --user daemon-reload
 }
 
-# Google Shared drives are separate Drive roots, so each one gets its own mount
-# next to the account's My Drive mount: ~/GoogleDrive/Shared drives/<email>/<name>.
+# Google Shared drives are separate Drive roots, so each one gets its own synced
+# folder next to the account's My Drive folder: ~/GoogleDrive/Shared drives/<email>/<name>.
 setup_shared_drives() {
   local email=$1 remote=$2
   local base="$gdrive_root/Shared drives/$email"
-  local -a mounts=() units=() labels=() keep=() restart=() start_units=() start_mounts=()
-  local drives="" id name slug mount unit_name unit pending failures=0 attempt index need
+  local -a mounts=() units=() labels=() keep=() restart=() start_units=()
+  local drives="" id name slug mount unit_name unit failures=0 index need
 
   if ! disabled "${GDRIVE_SHARED_DRIVES:-on}"; then
     if ! drives="$(shared_drives "$remote")"; then
@@ -687,9 +707,6 @@ setup_shared_drives() {
           need=1
         fi
         if ! systemctl --user is-active --quiet "$unit_name"; then
-          need=1
-        fi
-        if ! mountpoint -q "$mount"; then
           need=1
         fi
         keep+=("$unit_name")
@@ -717,9 +734,6 @@ setup_shared_drives() {
     if ! systemctl --user is-active --quiet "$unit_name"; then
       need=1
     fi
-    if ! mountpoint -q "$mount"; then
-      need=1
-    fi
     keep+=("$unit_name")
     mounts+=("$mount")
     units+=("$unit_name")
@@ -730,7 +744,6 @@ setup_shared_drives() {
   for index in "${!mounts[@]}"; do
     if ((restart[index] == 1)); then
       start_units+=("${units[$index]}")
-      start_mounts+=("${mounts[$index]}")
     fi
   done
 
@@ -740,31 +753,20 @@ setup_shared_drives() {
       systemctl --user enable "$unit_name" >/dev/null
       systemctl --user restart "$unit_name" || true
     done
-    for attempt in $(seq 1 45); do
-      pending=0
-      for mount in "${start_mounts[@]}"; do
-        if ! mountpoint -q "$mount"; then
-          pending=1
-        fi
-      done
-      if ((pending == 0)); then
-        break
-      fi
-      sleep 1
-    done
+    sleep 2
   fi
 
   for index in "${!mounts[@]}"; do
-    if ! mountpoint -q "${mounts[$index]}"; then
+    if ! systemctl --user is-active --quiet "${units[$index]}"; then
       systemctl --user status --no-pager "${units[$index]}" || true
       journalctl --user -u "${units[$index]}" -n 40 --no-pager || true
-      printf 'error: %s is not mounted\n' "${mounts[$index]}" >&2
+      printf 'error: %s is not syncing\n' "${mounts[$index]}" >&2
       failures=1
     elif ((restart[index] == 1)); then
-      printf '%s mounted at %s (service %s).\n' \
+      printf '%s syncing to %s (service %s).\n' \
         "${labels[$index]}" "${mounts[$index]}" "${units[$index]}"
     else
-      printf '%s is already mounted at %s (service %s).\n' \
+      printf '%s is already syncing to %s (service %s).\n' \
         "${labels[$index]}" "${mounts[$index]}" "${units[$index]}"
     fi
   done
@@ -840,7 +842,7 @@ reconcile() {
       warn "account $email is not ready; run omarchy-gdrive-setup --reauth $email"
       failures=1
     elif ! setup_shared_drives "$email" "$remote"; then
-      warn "some shared drives for $email are not mounted"
+      warn "some shared drives for $email are not syncing"
       failures=1
     fi
   done <"$accounts"
@@ -871,7 +873,9 @@ reconcile() {
     printf 'Finished with errors: some accounts need attention.\n'
     return 1
   fi
-  printf 'All accounts are mounted and listed in Files.\n'
+  printf 'All accounts are syncing and listed in Files.\n'
+  printf 'The first sync downloads everything in the background; follow it with:\n'
+  printf '  journalctl --user -f -u "rclone-*"\n'
   return 0
 }
 
@@ -909,7 +913,7 @@ add_account() {
     state_upsert "$email" "$existing"
     setup_account "$email" "$existing" || exit 1
     setup_shared_drives "$email" "$existing" ||
-      warn "some shared drives for $email are not mounted"
+      warn "some shared drives for $email are not syncing"
     bookmark_sync
     printf 'Account %s is already configured; token updated.\n' "$email"
     return 0
@@ -929,7 +933,7 @@ add_account() {
       state_upsert "$email" "$remote"
       setup_account "$email" "$remote" || exit 1
       setup_shared_drives "$email" "$remote" ||
-        warn "some shared drives for $email are not mounted"
+        warn "some shared drives for $email are not syncing"
       bookmark_sync
       printf 'Account %s is already configured; token updated.\n' "$email"
       return 0
@@ -952,7 +956,7 @@ add_account() {
   printf 'Created rclone remote %s for %s.\n' "$remote" "$email"
   setup_account "$email" "$remote" || exit 1
   setup_shared_drives "$email" "$remote" ||
-    warn "some shared drives for $email are not mounted"
+    warn "some shared drives for $email are not syncing"
   bookmark_sync
   printf 'Account %s is ready.\n' "$email"
   return 0
@@ -1030,9 +1034,9 @@ reauth() {
   state_upsert "$resolved" "$remote"
   setup_account "$resolved" "$remote" || exit 1
   setup_shared_drives "$resolved" "$remote" ||
-    warn "some shared drives for $resolved are not mounted"
+    warn "some shared drives for $resolved are not syncing"
   bookmark_sync
-  printf 'Account %s is authorized and mounted.\n' "$resolved"
+  printf 'Account %s is authorized and syncing.\n' "$resolved"
   return 0
 }
 

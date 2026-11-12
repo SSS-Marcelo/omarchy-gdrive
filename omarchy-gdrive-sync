@@ -1,0 +1,638 @@
+#!/usr/bin/env bash
+# Keep one local folder mirrored with one Google Drive root. Run by the
+# rclone-<remote>[-shared-<drive>].service units that omarchy-gdrive-setup
+# writes; not normally started by hand.
+#
+#   omarchy-gdrive-sync REMOTE: LOCAL [extra rclone flags...]
+#
+# Every file is stored on disk, so opening one never downloads it. Google Drive
+# is the source of truth:
+#   - local saves are uploaded a few seconds after the file is written
+#   - Drive is checked for changes every GDRIVE_SYNC_INTERVAL seconds
+#   - when the same file changed on both sides, the Drive version wins and the
+#     local edit is kept beside it as "<name>.conflict1.<ext>"
+#   - Google Docs, Sheets and Slides appear as .link.html files that open the
+#     document in the browser (GDRIVE_GDOCS=office exports .docx/.xlsx/.pptx)
+#
+# Top-level folders can be made online-only (omarchy-gdrive-mount --unpin, or
+# "Free Up Space" in Files). Their local copy is removed once every file is
+# confirmed in Google Drive, and the folder is replaced by a symlink into an
+# on-demand rclone mount of the same Drive, so it stays browsable and editable.
+# Every real (non-symlink) top-level folder is kept on this device, including
+# folders created locally. Root-level files are always kept on this device.
+#
+# SIGUSR1 forces an immediate sync; with a "force" file in the state
+# directory (omarchy-gdrive-mount --force-sync) it also confirms a bulk delete.
+# SIGTERM finishes the current transfer cleanly (bisync graceful shutdown) and exits.
+set -uo pipefail
+
+[[ $# -ge 2 ]] || { printf 'Usage: omarchy-gdrive-sync REMOTE: LOCAL [rclone flags...]\n' >&2; exit 2; }
+remote_path=$1
+local_path=${2%/}
+shift 2
+extra=("$@")
+
+rclone_bin="${RCLONE_BIN:-$(command -v rclone || true)}"
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+conf="${RCLONE_CONFIG:-$config_home/rclone/rclone.conf}"
+interval="${GDRIVE_SYNC_INTERVAL:-60}"
+debounce="${GDRIVE_SYNC_DEBOUNCE:-3}"
+gdocs="${GDRIVE_GDOCS:-link}"
+
+[[ -n "$rclone_bin" && -x "$rclone_bin" ]] || { printf 'error: rclone not found\n' >&2; exit 1; }
+[[ "$interval" =~ ^[0-9]+$ && "$interval" -ge 15 ]] || interval=60
+[[ "$debounce" =~ ^[0-9]+$ && "$debounce" -ge 1 ]] || debounce=3
+
+# One state directory per local folder, keyed by its path.
+key="$(printf '%s' "$remote_path|$local_path" | sha256sum | cut -c1-16)"
+state_dir="$state_home/omarchy-gdrive/sync/$key"
+workdir="$state_dir/bisync"
+filters="$state_dir/filters.txt"
+static_filters="$state_dir/never-sync.txt"
+status_file="$state_dir/status"
+run_log="$state_dir/last-run.log"
+selection_file="$state_dir/selection"
+requests="$state_dir/requests"
+online_dir="$state_dir/online"
+mkdir -p "$workdir"
+printf '%s\n%s\n' "$remote_path" "$local_path" >"$state_dir/target"
+
+label="${local_path##*/}"
+
+log() { printf '%s\n' "$*"; }
+
+set_status() {
+  # state<TAB>epoch<TAB>message, read by omarchy-gdrive-mount --status.
+  printf '%s\t%s\t%s\n' "$1" "$(date +%s)" "${2:-}" >"$status_file.tmp" &&
+    mv -f "$status_file.tmp" "$status_file"
+}
+
+notify() {
+  local urgency=$1 summary=$2 body=$3
+  command -v notify-send >/dev/null 2>&1 || return 0
+  notify-send -a "Google Drive" -u "$urgency" -i folder-remote "$summary" "$body" >/dev/null 2>&1 || true
+}
+
+glob_escape() { printf '%s' "$1" | sed 's/[][\\*?{}]/\\&/g'; }
+
+# Editor lock files, partial downloads, and atomic-save temporaries never go
+# to Drive. In "selected" mode only the pinned top-level folders and the
+# root-level files are synced. Bisync remembers this file's hash; a change forces a resync, which
+# run_bisync handles.
+write_filters() {
+  local tmp="$filters.tmp"
+  cat >"$static_filters" <<'EOF'
+# omarchy-gdrive: files that are never synced
+- .~lock.*#
+- ~$*
+- .~*
+- *.tmp
+- *.part
+- *.partial
+- *.crdownload
+- *.swp
+- *.swx
+- .goutputstream-*
+- .directory
+- .DS_Store
+- Thumbs.db
+- desktop.ini
+- .Trash-*/**
+- .omarchy-gdrive*
+EOF
+  cp -f "$static_filters" "$tmp"
+  if [[ "$sel_mode" == selected ]]; then
+    {
+      printf '# omarchy-gdrive: folders kept on this device; the rest is online-only\n'
+      local name
+      for name in ${sel_pins[@]+"${sel_pins[@]}"}; do
+        printf '+ /%s/**\n' "$(glob_escape "$name")"
+      done
+      printf '+ /*\n- **\n'
+    } >>"$tmp"
+  fi
+  if cmp -s "$tmp" "$filters"; then
+    rm -f "$tmp"
+  else
+    mv -f "$tmp" "$filters"
+  fi
+}
+
+base_args() {
+  local -a args=(
+    bisync "$remote_path" "$local_path"
+    --config "$conf"
+    --workdir "$workdir"
+    --filters-file "$filters"
+    --create-empty-src-dirs
+    --compare size,modtime
+    --conflict-resolve path1
+    --conflict-loser num
+    --conflict-suffix conflict
+    --suffix-keep-extension
+    --resilient
+    --recover
+    --max-lock 2m
+    --fast-list
+    --drive-acknowledge-abuse
+    --skip-links
+    --log-level INFO
+    --color NEVER
+    --stats 0
+  )
+  gdoc_args args
+  printf '%s\0' "${args[@]}" ${extra[@]+"${extra[@]}"}
+}
+
+gdoc_args() {
+  local -n out=$1
+  case "${gdocs,,}" in
+    office) out+=(--drive-export-formats docx,xlsx,pptx,svg) ;;
+    skip|off) out+=(--drive-skip-gdocs) ;;
+    *) out+=(--drive-export-formats link.html) ;;
+  esac
+}
+
+child=0
+stopping=0
+wake=0
+
+on_term() {
+  stopping=1
+  # SIGINT puts bisync into graceful shutdown so its listings stay valid.
+  if ((child > 0)) && kill -0 "$child" 2>/dev/null; then
+    kill -INT "$child" 2>/dev/null || true
+  fi
+}
+on_usr1() { wake=1; }
+trap on_term TERM INT
+trap on_usr1 USR1
+
+# Run rclone in the background so the TERM trap can forward SIGINT to it.
+rclone_run() {
+  local -a args=()
+  mapfile -d '' -t args < <(base_args)
+  "$rclone_bin" "${args[@]}" "$@" >"$run_log" 2>&1 &
+  child=$!
+  local rc=0
+  while :; do
+    wait "$child"
+    rc=$?
+    # wait returns >128 when a trap interrupts it; keep waiting for rclone.
+    if kill -0 "$child" 2>/dev/null; then
+      continue
+    fi
+    break
+  done
+  child=0
+  # Keep the journal useful without the per-run noise.
+  grep -vE '^[[:space:]{}]|^$|Bisyncing with Comparison|Setting --ignore-listing-checksum|shared Google Drive client_id|INFO  : $|lock file renewed|Synching Path|Building Path|Path[12] checking for diffs|Applying changes|Updating listings|Validating listings|Determining changes|Checking access|bisync is IN BETA|Using filters file|Storing filters file|Bisync successful|There was nothing to transfer|Transferred:|Errors:|Checks:|Elapsed time:' "$run_log" || true
+  return "$rc"
+}
+
+listings_exist() {
+  compgen -G "$workdir/*.path1.lst" >/dev/null && compgen -G "$workdir/*.path2.lst" >/dev/null
+}
+
+# Files recorded on the local side at the last successful sync.
+listing_count() {
+  local listing
+  listing="$(compgen -G "$workdir/*.path2.lst" | head -1)"
+  [[ -n "$listing" ]] || { printf '0\n'; return; }
+  grep -vc '^#' "$listing" || true
+}
+
+# Report conflicts from the last run: the Drive copy won, the local edit was
+# renamed beside it.
+report_conflicts() {
+  local count
+  if grep -q 'Renaming Path2 copy' "$run_log" 2>/dev/null; then
+    notify normal "Google Drive: edit conflict in $label" \
+      "A file changed both here and in Google Drive. The Google Drive version was kept; your local edit was saved beside it as a .conflict copy."
+  fi
+}
+
+run_bisync() {
+  local rc mode=${1:-normal}
+  write_filters
+
+  if [[ ! -d "$local_path" ]]; then
+    set_status error "local folder is missing"
+    log "error: $local_path is missing; not syncing (this would delete it in Google Drive)"
+    return 1
+  fi
+
+  if ! listings_exist; then
+    mode=initial
+  fi
+  if [[ "$mode" == reselect ]]; then
+    set_status syncing "updating folders kept on this device"
+    log "Folders kept on this device changed; rebuilding the sync state without deleting anything."
+    # A resync never deletes. It downloads newly pinned folders and uploads
+    # folders created locally, and forgets the ones that went online-only.
+    rclone_run --resync-mode newer
+    rc=$?
+  fi
+
+  # omarchy-gdrive-mount --force-sync drops this file and sends SIGUSR1.
+  if [[ "$mode" == reselect ]]; then
+    :
+  elif [[ "$mode" == normal && -e "$state_dir/force" ]]; then
+    rm -f "$state_dir/force"
+    log "Applying the confirmed bulk change (--force)."
+    set_status syncing "applying confirmed deletions"
+    rclone_run --force
+    rc=$?
+  elif [[ "$mode" == initial ]]; then
+    set_status syncing "first sync: downloading from Google Drive"
+    log "First sync of $local_path from $remote_path (Google Drive wins on differences)."
+    # path1 = Google Drive. A resync never deletes on either side; local-only
+    # files are uploaded, files that differ take the Drive version.
+    rclone_run --resync-mode path1
+    rc=$?
+  else
+    set_status syncing ""
+    rclone_run
+    rc=$?
+  fi
+
+  ((stopping == 1)) && return "$rc"
+
+  if ((rc != 0)) && grep -qiE 'must run --resync|cannot find prior Path1 or Path2 listings|filters file has changed' "$run_log"; then
+    # Listings are unusable (interrupted first run, filter change, crash).
+    # Recover with a non-destructive resync that keeps the newer copy, so an
+    # unsynced local edit is not lost.
+    log "Bisync needs a resync; recovering without deleting anything."
+    set_status syncing "recovering"
+    rclone_run --resync-mode newer
+    rc=$?
+  fi
+
+  if ((rc == 0)); then
+    set_status ok ""
+    report_conflicts
+    return 0
+  fi
+
+  if grep -qE 'Safety abort|too many deletes' "$run_log"; then
+    # bisync aborts when more than half of the files were deleted, or every
+    # file changed. In a folder of a handful of files that is ordinary editing,
+    # so only larger folders wait for confirmation.
+    if (($(listing_count) <= ${GDRIVE_SYNC_SMALL:-10})); then
+      log "Small folder: applying the change that tripped bisync's safety check."
+      rclone_run --force
+      rc=$?
+      if ((rc == 0)); then
+        set_status ok ""
+        report_conflicts
+        return 0
+      fi
+    fi
+  fi
+
+  if grep -qE 'Safety abort|too many deletes' "$run_log"; then
+    set_status error "too many deletions; sync paused for safety"
+    notify critical "Google Drive: sync paused for $label" \
+      "Many files were deleted or changed at once. If that was intended, right-click the folder in Files and choose Confirm Deletions and Sync, or run: omarchy-gdrive-mount --force-sync \"$local_path\""
+    return 2
+  fi
+
+  set_status error "$(grep -E 'ERROR|NOTICE: Failed' "$run_log" | tail -1 | cut -c1-200)"
+  return 1
+}
+
+# --- folders kept on this device ---------------------------------------------
+
+sel_mode=all
+sel_pins=()
+
+read_selection() {
+  sel_mode=all
+  sel_pins=()
+  [[ -f "$selection_file" ]] || return 0
+  local first=1 line
+  while IFS= read -r line; do
+    if ((first)); then
+      [[ "$line" == selected ]] && sel_mode=selected
+      first=0
+    elif [[ -n "$line" ]]; then
+      sel_pins+=("$line")
+    fi
+  done <"$selection_file"
+}
+
+write_selection() {
+  { printf '%s\n' "$sel_mode"; printf '%s\n' ${sel_pins[@]+"${sel_pins[@]}"}; } >"$selection_file.tmp" &&
+    mv -f "$selection_file.tmp" "$selection_file"
+}
+
+# Real top-level folders: these are the ones kept on this device.
+real_dirs() {
+  find "$local_path" -mindepth 1 -maxdepth 1 -type d ! -name '.Trash-*' -printf '%f\n' 2>/dev/null | LC_ALL=C sort
+}
+
+# Online-only placeholders: symlinks into the on-demand mount.
+our_links() {
+  local link target
+  for link in "$local_path"/* "$local_path"/.[!.]*; do
+    [[ -L "$link" ]] || continue
+    target="$(readlink "$link")"
+    [[ "$target" == "$online_dir/"* ]] && printf '%s\n' "${link##*/}"
+  done
+}
+
+safe_name() { [[ -n "$1" && "$1" != */* && "$1" != . && "$1" != .. ]]; }
+
+remote_join() {
+  if [[ "$remote_path" == *: ]]; then printf '%s%s\n' "$remote_path" "$1"; else printf '%s/%s\n' "$remote_path" "$1"; fi
+}
+
+online_pid=0
+start_online() {
+  if mountpoint -q "$online_dir" 2>/dev/null; then
+    if timeout 10 ls "$online_dir" >/dev/null 2>&1; then
+      return 0
+    fi
+    fusermount3 -uz "$online_dir" 2>/dev/null || true
+  fi
+  mkdir -p "$online_dir"
+  local -a args=(
+    mount "$remote_path" "$online_dir"
+    --config "$conf"
+    --cache-dir "$state_dir/cache"
+    --vfs-cache-mode full
+    --vfs-cache-max-size "${GDRIVE_ONLINE_CACHE:-5G}"
+    --vfs-cache-max-age 72h
+    --vfs-write-back 5s
+    --dir-cache-time 5m
+    --poll-interval 1m
+    --umask 022
+    --drive-acknowledge-abuse
+    --log-level NOTICE
+    --color NEVER
+  )
+  gdoc_args args
+  "$rclone_bin" "${args[@]}" ${extra[@]+"${extra[@]}"} &
+  online_pid=$!
+  local attempt
+  for attempt in $(seq 1 30); do
+    mountpoint -q "$online_dir" 2>/dev/null && return 0
+    kill -0 "$online_pid" 2>/dev/null || break
+    sleep 1
+  done
+  log "error: the on-demand mount for online-only folders did not start"
+  return 1
+}
+
+stop_online() {
+  if ((online_pid > 0)) && kill -0 "$online_pid" 2>/dev/null; then
+    kill -TERM "$online_pid" 2>/dev/null
+    local attempt
+    for attempt in $(seq 1 20); do
+      kill -0 "$online_pid" 2>/dev/null || break
+      sleep 0.5
+    done
+  fi
+  online_pid=0
+  if mountpoint -q "$online_dir" 2>/dev/null; then
+    fusermount3 -uz "$online_dir" 2>/dev/null || true
+  fi
+}
+
+# Free up space: delete the local copy only after every file in it is
+# confirmed identical in Google Drive.
+unpin_folder() {
+  local name=$1 dir="$local_path/$1"
+  safe_name "$name" || return 1
+  [[ -d "$dir" && ! -L "$dir" ]] || return 1
+  start_online || {
+    notify normal "Google Drive: could not free up space" "$name stays on this device: the on-demand mount is unavailable."
+    return 1
+  }
+  set_status syncing "checking $name before freeing up space"
+  local -a args=(check "$dir" "$(remote_join "$name")" --one-way --config "$conf"
+    --filter-from "$static_filters" --exclude '*.link.html' --skip-links --color NEVER --log-level ERROR)
+  gdoc_args args
+  if ! "$rclone_bin" "${args[@]}" ${extra[@]+"${extra[@]}"} >"$state_dir/check.log" 2>&1; then
+    log "Keeping $name on this device: some files are not in Google Drive yet."
+    grep -E 'ERROR' "$state_dir/check.log" | head -5
+    notify normal "Google Drive: $name kept on this device" \
+      "Some files in it are not in Google Drive yet. Try again after they upload."
+    return 1
+  fi
+  # Resolve the real path and refuse anything that is not a plain folder
+  # directly inside the local sync folder, on the same local filesystem.
+  # Deleting through a symlink or a FUSE mount would delete in Google Drive.
+  local real root_real online_real fstype
+  real="$(realpath -e -- "$dir" 2>/dev/null)" || return 1
+  root_real="$(realpath -e -- "$local_path" 2>/dev/null)" || return 1
+  online_real="$(realpath -m -- "$online_dir")"
+  fstype="$(stat -f -c %T -- "$real" 2>/dev/null)"
+  log "Free up space: local copy of $name resolves to $real ($fstype)"
+  if [[ "${real%/*}" != "$root_real" || "$real" == "$root_real" ]]; then
+    log "refusing to delete $real: it is not directly inside $root_real"
+    return 1
+  fi
+  if [[ "$real" == "$online_real" || "$real" == "$online_real/"* || "$fstype" == fuse* ]] ||
+    mountpoint -q -- "$real" ||
+    [[ "$(stat -c %d -- "$real")" != "$(stat -c %d -- "$root_real")" ]]; then
+    log "refusing to delete $real: it is a mount or not on the local disk"
+    return 1
+  fi
+  log "Removing $real"
+  rm -rf --one-file-system -- "$real" || return 1
+  ln -s "$online_dir/$name" "$dir" || return 1
+  log "Freed up space: $name is now online-only."
+  notify low "Google Drive: $name is online-only" "Its files open on demand and no longer use space on this device."
+  return 0
+}
+
+pin_folder() {
+  local name=$1 dir="$local_path/$1"
+  safe_name "$name" || return 1
+  [[ -L "$dir" && "$(readlink "$dir")" == "$online_dir/"* ]] || return 1
+  rm -f -- "$dir" && mkdir -p -- "$dir"
+  log "Keeping $name on this device."
+}
+
+# Apply pin/unpin requests, then resync if the set of local folders changed.
+apply_selection() {
+  local req name changed=0 work="$requests.work" before after
+  if [[ -s "$requests" ]]; then
+    mv -f "$requests" "$work"
+    while IFS=$'\t' read -r req name; do
+      case "$req" in
+        unpin)
+          if unpin_folder "$name"; then
+            sel_mode=selected
+            changed=1
+          fi
+          ;;
+        pin) pin_folder "$name" && changed=1 ;;
+        pin-all)
+          while IFS= read -r name; do
+            pin_folder "$name" || true
+          done < <(our_links)
+          sel_mode=all
+          changed=1
+          ;;
+      esac
+    done <"$work"
+    rm -f "$work"
+  fi
+
+  before="$(printf '%s\n' "${sel_mode}" ${sel_pins[@]+"${sel_pins[@]}"})"
+  if [[ "$sel_mode" == selected ]]; then
+    mapfile -t sel_pins < <(real_dirs)
+  else
+    sel_pins=()
+  fi
+  after="$(printf '%s\n' "${sel_mode}" ${sel_pins[@]+"${sel_pins[@]}"})"
+  write_selection
+
+  if [[ "$sel_mode" == all ]]; then
+    [[ -n "$(our_links)" ]] || stop_online
+  fi
+
+  if [[ "$before" != "$after" ]] || ((changed)); then
+    run_bisync reselect
+    return $?
+  fi
+  return 0
+}
+
+# Online-only folders appear as symlinks next to the local ones.
+maintain_links() {
+  [[ "$sel_mode" == selected ]] || return 0
+  start_online || return 1
+  local listing name
+  listing="$(timeout 60 find "$online_dir" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null)" || return 1
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if [[ ! -e "$local_path/$name" && ! -L "$local_path/$name" ]]; then
+      ln -s "$online_dir/$name" "$local_path/$name"
+    fi
+  done <<<"$listing"
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if ! grep -Fxq -- "$name" <<<"$listing"; then
+      rm -f -- "$local_path/$name"
+    fi
+  done < <(our_links)
+}
+
+run_cycle() {
+  run_bisync || return $?
+  ((stopping == 1)) && return 0
+  apply_selection || return $?
+  ((stopping == 1)) && return 0
+  maintain_links || true
+  return 0
+}
+
+# --- safety before the first run ---------------------------------------------
+
+mkdir -p "$local_path"
+
+# An rclone FUSE mount from omarchy-gdrive <= 0.4 may still sit on the folder.
+if mountpoint -q "$local_path" 2>/dev/null; then
+  log "Unmounting the old rclone mount at $local_path"
+  fusermount3 -u "$local_path" 2>/dev/null || fusermount3 -uz "$local_path" 2>/dev/null || true
+  sleep 1
+  if mountpoint -q "$local_path" 2>/dev/null; then
+    set_status error "folder is still a FUSE mount"
+    log "error: $local_path is still mounted; refusing to sync into it"
+    exit 1
+  fi
+fi
+
+# --- watch loop --------------------------------------------------------------
+
+events=""
+watcher=0
+start_watcher() {
+  command -v inotifywait >/dev/null 2>&1 || { log "inotifywait not found; checking local changes every ${interval}s"; return; }
+  events="$state_dir/events"
+  rm -f "$events"
+  mkfifo "$events"
+  inotifywait -m -r -q \
+    -e close_write -e moved_to -e moved_from -e create -e delete -e attrib \
+    --format '%w%f' \
+    --exclude '(/\.~lock\..*#$|/\.goutputstream-|\.part$|\.partial$|\.swp$|/\.Trash-)' \
+    "$local_path" >"$events" 2>/dev/null &
+  watcher=$!
+  exec 3<>"$events"
+}
+
+stop_watcher() {
+  ((watcher > 0)) && kill "$watcher" 2>/dev/null
+  exec 3<&- 2>/dev/null
+  [[ -n "$events" ]] && rm -f "$events"
+  watcher=0
+}
+trap 'stop_watcher; stop_online' EXIT
+
+# Discard events produced by our own downloads.
+drain_events() {
+  ((watcher > 0)) || return 0
+  local line
+  while IFS= read -r -t 0.2 line <&3; do :; done
+}
+
+log "Syncing $local_path <-> $remote_path (Drive check every ${interval}s)."
+read_selection
+if [[ "$sel_mode" == selected ]]; then
+  start_online && maintain_links
+fi
+start_watcher
+
+failures=0
+while ((stopping == 0)); do
+  wake=0
+  if run_cycle; then
+    failures=0
+  else
+    failures=$((failures + 1))
+  fi
+  ((stopping == 1)) && break
+  drain_events
+
+  # Back off on repeated failures (offline, quota), up to 10 minutes.
+  wait_for=$interval
+  if ((failures > 0)); then
+    wait_for=$((interval * (failures < 10 ? failures : 10)))
+  fi
+
+  deadline=$((SECONDS + wait_for))
+  changed=0
+  # read -t 1 steps so SIGTERM and SIGUSR1 are handled within a second.
+  while ((stopping == 0 && wake == 0 && SECONDS < deadline)); do
+    if ((watcher > 0)); then
+      if IFS= read -r -t 1 _ <&3; then
+        changed=1
+        break
+      fi
+    else
+      sleep 1
+    fi
+  done
+
+  # Let a burst of writes (an editor's atomic save, a folder copy) settle,
+  # but never hold an upload back for more than 30 seconds.
+  if ((changed == 1)); then
+    settle_deadline=$((SECONDS + 30))
+    quiet=0
+    while ((stopping == 0 && quiet < debounce && SECONDS < settle_deadline)); do
+      if IFS= read -r -t 1 _ <&3; then
+        quiet=0
+      else
+        quiet=$((quiet + 1))
+      fi
+    done
+  fi
+done
+
+set_status stopped ""
+log "Stopped syncing $local_path."
+exit 0

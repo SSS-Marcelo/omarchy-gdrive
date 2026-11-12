@@ -1,80 +1,251 @@
 #!/usr/bin/env bash
-# Connect, disconnect, or report one Google Drive mount created by
-# omarchy-gdrive-setup. Used by the Files context menu.
+# Control synced Google Drive folders created by omarchy-gdrive-setup. Used by
+# the Files context menu.
 #
-#   omarchy-gdrive-mount --status PATH
-#   omarchy-gdrive-mount --disconnect PATH
-#   omarchy-gdrive-mount --connect PATH
+#   omarchy-gdrive-mount --status ROOT        connected|disconnected, sync state, online-only folders
+#   omarchy-gdrive-mount --sync-now ROOT      check Google Drive and upload right away
+#   omarchy-gdrive-mount --pause ROOT         stop syncing (files stay on disk)
+#   omarchy-gdrive-mount --resume ROOT        start syncing again
+#   omarchy-gdrive-mount --force-sync ROOT    confirm a bulk delete that paused sync
+#   omarchy-gdrive-mount --pin FOLDER...      keep online-only folders on this device
+#   omarchy-gdrive-mount --unpin [--yes] FOLDER...
+#                                             free up space: make folders online-only
+#   omarchy-gdrive-mount --pin-all ROOT       keep everything on this device
+#   omarchy-gdrive-mount --unpin-all [--yes] ROOT
+#                                             make every folder online-only
+#
+# ROOT is an account folder (~/GoogleDrive/<email>) or a Google Shared drive
+# folder (~/GoogleDrive/Shared drives/<email>/<drive>). FOLDER is a folder
+# directly inside a ROOT. --disconnect and --connect are the 0.4 names for
+# --pause and --resume.
 set -euo pipefail
 
 usage() {
-  cat <<'EOF'
-Usage: omarchy-gdrive-mount --status|--connect|--disconnect PATH
-
-PATH is the mount point of an account (~/GoogleDrive/<email>) or of a Google
-Shared drive (~/GoogleDrive/Shared drives/<email>/<drive>).
-EOF
+  sed -n '4,20s/^# \{0,1\}//p' "$0" >&2
 }
 
-[[ $# -eq 2 ]] || { usage >&2; exit 2; }
+[[ $# -ge 2 ]] || { usage; exit 2; }
 mode=$1
-target=${2%/}
+shift
+assume_yes=0
+if [[ "${1:-}" == --yes || "${1:-}" == -y ]]; then
+  assume_yes=1
+  shift
+fi
+(($# > 0)) || { usage; exit 2; }
 
 config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
 unit_dir="$config_home/systemd/user"
 
-unit=""
-mount=""
-for unit_file in "$unit_dir"/rclone-*.service; do
-  [[ -f "$unit_file" ]] || continue
-  candidate="$(sed -n 's/^ExecStart=.* mount "[^"]*" "\([^"]*\)".*/\1/p' "$unit_file" | head -1)"
-  if [[ -n "$candidate" && "$candidate" == "$target" ]]; then
-    unit="${unit_file##*/}"
-    mount="$candidate"
-    break
-  fi
-done
+# Unit that syncs ROOT, empty when there is none.
+unit_for_root() {
+  local root=${1%/} unit_file candidate
+  for unit_file in "$unit_dir"/rclone-*.service; do
+    [[ -f "$unit_file" ]] || continue
+    candidate="$(sed -n -e 's/^ExecStart=.*omarchy-gdrive-sync" "[^"]*" "\([^"]*\)".*/\1/p' \
+      -e 's/^ExecStart=.* mount "[^"]*" "\([^"]*\)".*/\1/p' "$unit_file" | head -1)"
+    if [[ -n "$candidate" && "$candidate" == "$root" ]]; then
+      printf '%s\n' "${unit_file##*/}"
+      return 0
+    fi
+  done
+  return 1
+}
 
-is_mounted() { mountpoint -q "$mount" 2>/dev/null; }
+# The sync daemon's state directory records "<remote>\n<local>" in "target".
+state_dir_for_root() {
+  local root=${1%/} dir
+  for dir in "$state_home"/omarchy-gdrive/sync/*/; do
+    [[ -f "$dir/target" ]] || continue
+    if [[ "$(sed -n 2p "$dir/target")" == "$root" ]]; then
+      printf '%s\n' "${dir%/}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+require_root() {
+  unit="$(unit_for_root "$1")" || { printf 'error: no Google Drive folder at %s\n' "$1" >&2; exit 1; }
+}
+
+is_active() { systemctl --user is-active --quiet "$1"; }
+
+wake() {
+  systemctl --user kill --kill-whom=main -s USR1 "$1"
+}
+
+# Queue "<request>\t<folder name>" for the daemon of ROOT and wake it.
+queue() {
+  local root=$1 request=$2 name=${3:-} unit dir
+  unit="$(unit_for_root "$root")"
+  is_active "$unit" || { printf 'error: sync is paused for %s; resume it first\n' "$root" >&2; exit 1; }
+  dir="$(state_dir_for_root "$root")" || { printf 'error: %s has not synced yet\n' "$root" >&2; exit 1; }
+  printf '%s\t%s\n' "$request" "$name" >>"$dir/requests"
+  wake "$unit"
+}
+
+# Split FOLDER into its ROOT and name; the ROOT must be a synced folder.
+split_folder() {
+  local folder=${1%/}
+  folder_root="${folder%/*}"
+  folder_name="${folder##*/}"
+  [[ -n "$folder_name" && "$folder_root" != "$folder" ]] || return 1
+  unit_for_root "$folder_root" >/dev/null
+}
+
+confirm() {
+  if ((assume_yes)); then
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    printf 'error: confirmation needed; run in a terminal or pass --yes\n' >&2
+    exit 1
+  fi
+  local answer
+  read -r -p "$1 [y/N] " answer
+  [[ "${answer,,}" == y || "${answer,,}" == yes ]]
+}
+
+# Show what freeing up space would delete, resolved to real paths.
+describe_local_copy() {
+  local folder=$1 real fstype size count
+  real="$(realpath -e -- "$folder")"
+  fstype="$(stat -f -c %T -- "$real")"
+  size="$(du -sh --one-file-system -- "$real" 2>/dev/null | cut -f1)"
+  count="$(find "$real" -xdev -type f 2>/dev/null | wc -l)"
+  printf '  %s\n' "$folder"
+  printf '    real path: %s\n' "$real"
+  printf '    on: %s, %s in %s files\n' "$fstype" "${size:-?}" "$count"
+  if [[ "$real" != "$folder" ]]; then
+    printf '    warning: the path resolves somewhere else; the sync service will refuse it\n'
+  fi
+  if [[ "$fstype" == fuse* ]]; then
+    printf '    warning: this is a FUSE mount, not a local copy; the sync service will refuse it\n'
+  fi
+}
 
 case "$mode" in
   --status)
-    [[ -n "$unit" ]] || { printf 'unknown\n'; exit 1; }
-    if is_mounted; then printf 'connected\n'; else printf 'disconnected\n'; fi
+    root=${1%/}
+    require_root "$root"
+    if is_active "$unit"; then printf 'connected\n'; else printf 'disconnected\n'; fi
+    if dir="$(state_dir_for_root "$root")"; then
+      if [[ -f "$dir/status" ]]; then
+        IFS=$'\t' read -r state when message <"$dir/status" || true
+        printf '%s %s %s\n' "${state:-unknown}" "$(date -d "@${when:-0}" '+%F %T' 2>/dev/null)" "${message:-}"
+      fi
+      if [[ "$(head -1 "$dir/selection" 2>/dev/null)" == selected ]]; then
+        printf 'kept on this device: selected folders\n'
+        for link in "$root"/* "$root"/.[!.]*; do
+          [[ -L "$link" ]] && printf '  online-only: %s\n' "${link##*/}"
+        done
+      else
+        printf 'kept on this device: everything\n'
+      fi
+    fi
     ;;
-  --disconnect)
-    [[ -n "$unit" ]] || { printf 'error: no Google Drive mount at %s\n' "$target" >&2; exit 1; }
-    # disable keeps it down across logins; omarchy-gdrive-setup re-enables it.
+  --sync-now)
+    require_root "${1%/}"
+    is_active "$unit" || { printf 'error: sync is paused for %s\n' "$1" >&2; exit 1; }
+    wake "$unit"
+    printf 'Syncing %s\n' "$1"
+    ;;
+  --force-sync)
+    root=${1%/}
+    require_root "$root"
+    dir="$(state_dir_for_root "$root")" || { printf 'error: %s has not synced yet\n' "$root" >&2; exit 1; }
+    : >"$dir/force"
+    if is_active "$unit"; then
+      wake "$unit"
+    else
+      systemctl --user enable --now "$unit" >/dev/null 2>&1
+    fi
+    printf 'Applying the pending changes for %s\n' "$root"
+    ;;
+  --pause|--disconnect)
+    require_root "${1%/}"
+    # disable keeps it paused across logins; omarchy-gdrive-setup re-enables it.
     systemctl --user disable --now "$unit" >/dev/null 2>&1 || true
     systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
-    if is_mounted; then
-      fusermount3 -uz "$mount" >/dev/null 2>&1 || true
-    fi
-    sleep 1
-    if is_mounted; then
-      printf 'error: %s is still mounted\n' "$mount" >&2
+    if is_active "$unit"; then
+      printf 'error: %s is still syncing\n' "$1" >&2
       exit 1
     fi
-    printf 'Disconnected %s\n' "$mount"
+    printf 'Paused syncing %s (files stay on disk)\n' "$1"
     ;;
-  --connect)
-    [[ -n "$unit" ]] || { printf 'error: no Google Drive mount at %s\n' "$target" >&2; exit 1; }
-    systemctl --user enable "$unit" >/dev/null 2>&1 || true
-    systemctl --user start "$unit"
-    for _ in $(seq 1 30); do
-      if is_mounted; then
-        break
-      fi
-      sleep 1
+  --resume|--connect)
+    require_root "${1%/}"
+    systemctl --user enable --now "$unit" >/dev/null 2>&1 || systemctl --user start "$unit"
+    sleep 1
+    is_active "$unit" || { printf 'error: %s did not start syncing\n' "$1" >&2; exit 1; }
+    printf 'Resumed syncing %s\n' "$1"
+    ;;
+  --pin)
+    for folder in "$@"; do
+      folder=${folder%/}
+      split_folder "$folder" || { printf 'error: %s is not a folder directly inside a Google Drive folder\n' "$folder" >&2; exit 1; }
+      [[ -L "$folder" ]] || { printf '%s is already on this device\n' "$folder"; continue; }
+      queue "$folder_root" pin "$folder_name"
+      printf 'Downloading %s to keep it on this device\n' "$folder"
     done
-    if ! is_mounted; then
-      printf 'error: %s is not mounted\n' "$mount" >&2
-      exit 1
-    fi
-    printf 'Connected %s\n' "$mount"
+    ;;
+  --unpin)
+    declare -a todo=()
+    printf 'Free up space: delete the local copy of these folders.\n'
+    printf 'They stay in Google Drive and open on demand from the same place.\n\n'
+    for folder in "$@"; do
+      folder=${folder%/}
+      split_folder "$folder" || { printf 'error: %s is not a folder directly inside a Google Drive folder\n' "$folder" >&2; exit 1; }
+      if [[ -L "$folder" ]]; then
+        printf '  %s is already online-only\n' "$folder"
+        continue
+      fi
+      [[ -d "$folder" ]] || { printf 'error: %s is not a folder\n' "$folder" >&2; exit 1; }
+      describe_local_copy "$folder"
+      todo+=("$folder")
+    done
+    ((${#todo[@]})) || exit 0
+    printf '\nEach folder is compared with Google Drive first; any folder with files\n'
+    printf 'that are not in Google Drive yet is kept.\n'
+    confirm "Delete these local copies?" || { printf 'Nothing changed.\n'; exit 1; }
+    for folder in "${todo[@]}"; do
+      split_folder "$folder"
+      queue "$folder_root" unpin "$folder_name"
+    done
+    printf 'Queued. Progress: journalctl --user -f -u %s\n' "$(unit_for_root "$folder_root")"
+    ;;
+  --pin-all)
+    root=${1%/}
+    require_root "$root"
+    queue "$root" pin-all
+    printf 'Downloading everything in %s to keep it on this device\n' "$root"
+    ;;
+  --unpin-all)
+    root=${1%/}
+    require_root "$root"
+    declare -a dirs=()
+    while IFS= read -r -d '' folder; do
+      dirs+=("$folder")
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d ! -name '.Trash-*' -print0 | sort -z)
+    ((${#dirs[@]})) || { printf 'No folders in %s are kept on this device.\n' "$root"; exit 0; }
+    printf 'Free up space: delete the local copy of every folder in %s.\n' "$root"
+    printf 'Files directly in %s stay on this device. Everything stays in Google Drive.\n\n' "$root"
+    for folder in "${dirs[@]}"; do
+      describe_local_copy "$folder"
+    done
+    printf '\nEach folder is compared with Google Drive first; any folder with files\n'
+    printf 'that are not in Google Drive yet is kept.\n'
+    confirm "Delete these local copies?" || { printf 'Nothing changed.\n'; exit 1; }
+    # Queue exactly the folders shown above, nothing created since.
+    for folder in "${dirs[@]}"; do
+      queue "$root" unpin "${folder##*/}"
+    done
+    printf 'Queued. Progress: journalctl --user -f -u %s\n' "$unit"
     ;;
   *)
-    usage >&2
+    usage
     exit 2
     ;;
 esac
