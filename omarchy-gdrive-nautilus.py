@@ -8,6 +8,10 @@
 - Item menu on folders directly inside one of those: "Keep on This Device" for
   online-only folders, "Free Up Space (Online Only)" for local ones. Freeing up
   space opens a terminal that shows the real paths and asks before deleting.
+- Emblems on everything inside a synced folder: a green check for files kept
+  on this device and in sync, a blue cloud for online-only, blue arrows while
+  syncing, a red "!" on a drive that has a sync error or is paused for
+  safety, and a grey pause badge on a drive whose sync is paused. List view gets a "Google Drive" column with the same state as text.
 
 Installed as /usr/share/nautilus-python/extensions/omarchy-gdrive.py.
 """
@@ -16,13 +20,14 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from gi import require_version
 
 require_version("Nautilus", "4.1")
 
-from gi.repository import Gio, GObject, Nautilus  # noqa: E402
+from gi.repository import Gio, GLib, GObject, Nautilus  # noqa: E402
 
 SETUP = "omarchy-gdrive-setup"
 MOUNT = "omarchy-gdrive-mount"
@@ -140,6 +145,145 @@ def drive_mode(path):
         return (directory / "selection").read_text().split("\n", 1)[0] or "all"
     except (OSError, TypeError):
         return "all"
+
+
+# --- sync state emblems -------------------------------------------------------
+
+EMBLEM = {
+    "synced": "omarchy-gdrive-synced",
+    "online": "omarchy-gdrive-online",
+    "syncing": "omarchy-gdrive-syncing",
+    "error": "omarchy-gdrive-error",
+    "paused": "omarchy-gdrive-paused",
+}
+LABEL = {
+    "synced": "On this device",
+    "online": "Online-only",
+    "syncing": "Syncing…",
+    "error": "Sync error",
+    "paused": "Paused",
+    "": "",
+}
+CACHE_SECONDS = 2.0
+
+
+class DriveState:
+    """Roots, modes and statuses, re-read at most every CACHE_SECONDS so that
+    update_file_info stays cheap for folders with thousands of files."""
+
+    def __init__(self):
+        self.read_at = 0.0
+        self.roots = []  # (root, mode, state), longest root first
+
+    def refresh(self, force=False):
+        now = time.monotonic()
+        if not force and now - self.read_at < CACHE_SECONDS:
+            return
+        self.read_at = now
+        roots = []
+        for root in mount_units():
+            directory = state_dir(root)
+            mode, state = "all", ""
+            if directory is not None:
+                try:
+                    mode = (directory / "selection").read_text().split("\n", 1)[0] or "all"
+                except OSError:
+                    pass
+                try:
+                    state = (directory / "status").read_text().split("\t", 1)[0]
+                except OSError:
+                    pass
+            roots.append((root, mode, state))
+        roots.sort(key=lambda item: len(item[0]), reverse=True)
+        self.roots = roots
+
+    def root_for(self, path):
+        for root, mode, state in self.roots:
+            if path == root or path.startswith(root + "/"):
+                return root, mode, state
+        return None, None, None
+
+    def status(self, path):
+        """synced, online, syncing, error, paused, or "" (not ours / unknown)."""
+        self.refresh()
+        root, mode, state = self.root_for(path)
+        if root is None:
+            return ""
+        if state == "stopped":
+            return "paused"
+        if mode == "online":
+            return "online"
+        if path != root:
+            top = os.path.join(root, path[len(root) + 1:].split("/", 1)[0])
+            if os.path.islink(top):
+                return "online"
+        if state == "error":
+            # Only the drive itself carries the error; its files may or may
+            # not be up to date, so they get no check mark.
+            return "error" if path == root else ""
+        if state == "syncing":
+            return "syncing"
+        if state == "ok":
+            return "synced"
+        return ""
+
+    def snapshot(self):
+        self.refresh(force=True)
+        return {root: (mode, state) for root, mode, state in self.roots}
+
+
+STATE = DriveState()
+
+
+class OmarchyGDriveEmblems(GObject.GObject, Nautilus.InfoProvider, Nautilus.ColumnProvider):
+    def __init__(self):
+        super().__init__()
+        # Files whose emblem follows the drive's live state (roots and their
+        # top-level entries); refreshed when a drive's status changes.
+        self.live = {}
+        self.last = STATE.snapshot()
+        GLib.timeout_add_seconds(3, self._poll)
+
+    def get_columns(self):
+        return [
+            Nautilus.Column(
+                name="OmarchyGDrive::status",
+                attribute="omarchy_gdrive_status",
+                label="Google Drive",
+                description="Whether the item is on this device, online-only, or syncing",
+            )
+        ]
+
+    def update_file_info(self, file_info):
+        path = path_of(file_info)
+        if path is None:
+            return
+        status = STATE.status(path)
+        file_info.add_string_attribute("omarchy_gdrive_status", LABEL.get(status, ""))
+        root, _mode, _state = STATE.root_for(path)
+        # A paused drive shows the badge on the drive folder only; its files
+        # say "Paused" in the Google Drive column.
+        if status in EMBLEM and not (status == "paused" and path != root):
+            file_info.add_emblem(EMBLEM[status])
+        if status:
+            if root is not None and (path == root or os.path.dirname(path) == root):
+                self.live[path] = file_info
+
+    def _poll(self):
+        current = STATE.snapshot()
+        changed = {root for root in current if current.get(root) != self.last.get(root)}
+        self.last = current
+        if changed:
+            for path, file_info in list(self.live.items()):
+                if any(path == root or path.startswith(root + "/") for root in changed):
+                    try:
+                        file_info.invalidate_extension_info()
+                    except Exception:
+                        self.live.pop(path, None)
+        # Forget entries for roots that no longer exist.
+        if len(self.live) > 2000:
+            self.live.clear()
+        return True
 
 
 class OmarchyGDriveMenu(GObject.GObject, Nautilus.MenuProvider):

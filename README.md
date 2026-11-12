@@ -170,6 +170,24 @@ back into the Google Doc. That conversion is lossy, which is why `link` is the
 default. Edit Google Docs in the browser, and rename or move them on
 drive.google.com: a local rename is synced as delete + create.
 
+## Sync status in Files
+
+Everything inside a Google Drive folder carries a badge:
+
+| Badge | Meaning |
+|---|---|
+| Green check | Stored on this device and in sync with Google Drive |
+| Blue cloud | Online-only: opens on demand, takes no space |
+| Amber arrows | Syncing now (on the drive folder and its top-level items) |
+| Red "!" | The drive has a sync error, or a safety stop is waiting for **Confirm Deletions and Sync** |
+| Grey pause | Sync is paused for this drive (**Resume Google Drive Sync**) |
+
+Badges update within a few seconds of a change. In list view, right-click the
+column header and enable **Google Drive** for the same state as text ("On this
+device", "Online-only", "Syncing…", "Sync error", "Paused"). Online-only
+folders also show Files' own link arrow, because they are links into the
+on-demand mount.
+
 ## Choose what is kept on this device
 
 By default everything in My Drive is kept on this device, and Shared drives
