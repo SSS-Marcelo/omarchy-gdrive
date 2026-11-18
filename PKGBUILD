@@ -10,7 +10,7 @@ depends=('rclone' 'inotify-tools' 'libnotify' 'fuse3' 'python' 'nautilus' 'nauti
 makedepends=()
 install=omarchy-gdrive.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('ef1b12cee91ad874ea3e7cc4786f1a2adc778187eed5a96c9a746af5f7df7429')
 
 package() {
   install -Dm755 "$srcdir/$pkgname-$pkgver/omarchy-gdrive-setup" "$pkgdir/usr/bin/omarchy-gdrive-setup"
