@@ -66,18 +66,24 @@ opt-in (`GDRIVE_SHARED_WITH_ME=1`).
 
 ## Install
 
-From the built architecture-independent package:
+Add the public `omarchy-pkgs` pacman repository, then install:
 
 ```bash
-sudo pacman -S --needed rclone inotify-tools libnotify fuse3 python nautilus nautilus-python
-sudo pacman -U omarchy-gdrive-0.6.0-1-any.pkg.tar.zst
+sudo tee -a /etc/pacman.conf >/dev/null <<'EOF'
+
+[omarchy-pkgs]
+SigLevel = Optional TrustAll
+Server = https://skystone-studio.github.io/omarchy-pkgs/x86_64
+EOF
+sudo pacman -Syu omarchy-gdrive
 ```
 
-Or build from source:
+The database is unsigned (`Optional TrustAll`); the site is HTTPS-only. If you
+would rather not add a repository, build from source:
 
 ```bash
-tar -xzf omarchy-gdrive-0.6.0.tar.gz
-cd omarchy-gdrive-0.6.0
+git clone https://github.com/SSS-Marcelo/omarchy-gdrive.git
+cd omarchy-gdrive
 makepkg -si
 ```
 
@@ -519,34 +525,19 @@ makepkg --printsrcinfo > .SRCINFO
 makepkg -f
 ```
 
-The `PKGBUILD` builds from the files in this repository, which is private, and
-the built package is published as a release artifact there. Do not commit
-`dist/`, `pkg/`, `repo/`, or `src/`.
-
-### Private pacman repository
+The `PKGBUILD` downloads the tagged source tarball
+(`archive/v<pkgver>.tar.gz`) from this repository, so a release is: bump
+`pkgver`, commit, push a `v<pkgver>` tag, then run `updpkgsums` and
+`makepkg --printsrcinfo > .SRCINFO`. Do not commit `dist/`, `pkg/`, `repo/`,
+or `src/`.
 
 `./make-repo.sh` builds the package and refreshes a pacman repository under
 `repo/x86_64` with `repo-add`; `--sign` / `--key KEY` sign the database. Serve
-that directory over HTTPS, or plain HTTP on a trusted network such as
-Tailscale, and add it to `/etc/pacman.conf`:
-
-```ini
-[omarchy-gdrive]
-SigLevel = Optional TrustAll
-Server = https://<host>/x86_64
-```
-
-Then `sudo pacman -Syu omarchy-gdrive`. Use
-`SigLevel = Optional DatabaseRequired` when the database is signed.
-
-The public copy is served from the `omarchy-pkgs` repository, which builds the
-package in an `archlinux:base-devel` container with GitHub Pages:
-
-```ini
-[omarchy-pkgs]
-SigLevel = Optional TrustAll
-Server = https://skystone-studio.github.io/omarchy-pkgs/x86_64
-```
+that directory over HTTPS and add it to `/etc/pacman.conf` with
+`Server = https://<host>/x86_64`. The public copy is the
+[`omarchy-pkgs`](https://github.com/SkyStone-Studio/omarchy-pkgs) repository,
+which builds the package in an `archlinux:base-devel` container and publishes
+it with GitHub Pages.
 
 ## License
 
