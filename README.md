@@ -1,5 +1,28 @@
 # Google Drive for Omarchy Files
 
+## Quick install (Omarchy)
+
+1. Open a terminal: press **Super + Enter**.
+2. Copy this whole block, paste it into the terminal (**Ctrl + Shift + V**),
+   and press **Enter**. Type your password if asked.
+
+   ```bash
+   grep -q '^\[omarchy-pkgs\]' /etc/pacman.conf || sudo tee -a /etc/pacman.conf >/dev/null <<'EOF'
+
+   [omarchy-pkgs]
+   SigLevel = Optional TrustAll
+   Server = https://skystone-studio.github.io/omarchy-pkgs/x86_64
+   EOF
+   sudo pacman -Syu --noconfirm omarchy-gdrive
+   nautilus --quit
+   ```
+
+3. Connect your Google account: type `omarchy-gdrive-setup` and press **Enter**.
+   A browser window opens so you can sign in to Google.
+4. Open **Files**. Your Google Drive is in the sidebar.
+
+To update later, run `sudo pacman -Syu`.
+
 Keeps every Google Drive account's My Drive synced to an ordinary local folder,
 and shows every Shared drive online-only until you choose to keep it on this
 device, the way Google Drive for desktop ("Mirror files") and
